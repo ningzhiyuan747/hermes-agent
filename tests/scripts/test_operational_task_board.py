@@ -17,18 +17,32 @@ def load_module():
     return module
 
 
+def test_collect_snapshot_delegates_to_operational_task_board_service(monkeypatch):
+    mod = load_module()
+    expected = {"units": [{"unit_id": "run:run-1"}], "counts": {}}
+    monkeypatch.setattr(mod, "build_operational_task_snapshot", lambda limit=8: expected)
+
+    snapshot = mod.collect_snapshot(limit=5)
+
+    assert snapshot is expected
+
+
 def test_build_report_highlights_distributed_task_state():
     mod = load_module()
     snapshot = {
         "capability_runs": [{"run_id": "run-1", "status": "queued", "title": "Weixin watchdog recovery"}],
         "background_jobs": [{"job_id": "job-1", "status": "failed", "title": "OpenClaw retry"}],
-        "subagent_tasks": [{"status": "created", "worker_role": "ops-worker", "goal": "Check watchdog chain"}],
-        "run_counts": {"queued": 1},
-        "job_counts": {"failed": 1},
-        "subagent_counts": {"created": 1},
-        "active_runs": [{"run_id": "run-1", "status": "queued", "title": "Weixin watchdog recovery"}],
-        "active_jobs": [],
-        "active_subagents": [{"status": "created", "worker_role": "ops-worker", "goal": "Check watchdog chain"}],
+        "delegation_tasks": [{"status": "created", "worker_role": "ops-worker", "goal": "Check watchdog chain"}],
+        "counts": {
+            "capability_runs": {"queued": 1},
+            "background_jobs": {"failed": 1},
+            "delegation_tasks": {"created": 1},
+        },
+        "units": [
+            {"unit_id": "subagent:deleg-1", "unit_type": "delegation_task", "status": "created", "owner": "ops-worker", "title": "Check watchdog chain"},
+            {"unit_id": "run:run-1", "unit_type": "capability_run", "status": "queued", "title": "Weixin watchdog recovery"},
+            {"unit_id": "job:job-1", "unit_type": "background_job", "status": "failed", "title": "OpenClaw retry"},
+        ],
     }
 
     report = mod.build_report(snapshot, limit=5)

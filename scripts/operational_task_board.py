@@ -6,8 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-import time
-from collections import Counter
 from pathlib import Path
 from typing import Any
 
@@ -15,13 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from agent.background_jobs import list_jobs
-from agent.business_db import list_capability_runs
-from scripts.subagent_task_status import _load_task_meta
-
-ACTIVE_RUN_STATUSES = {"queued", "running", "pending_approval", "blocked", "paused"}
-ACTIVE_JOB_STATUSES = {"queued", "running", "paused", "blocked"}
-ACTIVE_SUBAGENT_STATUSES = {"created", "running"}
+from agent.operational_task_board_service import build_operational_task_snapshot
 
 
 def _short(text: Any, limit: int = 72) -> str:
@@ -29,48 +21,20 @@ def _short(text: Any, limit: int = 72) -> str:
     return value if len(value) <= limit else value[: limit - 3] + "..."
 
 
-def _status_counts(rows: list[dict[str, Any]], key: str = "status") -> dict[str, int]:
-    counter = Counter(str(row.get(key) or "unknown").strip() or "unknown" for row in rows)
-    return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
-
-
-def _active_runs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if str(row.get("status") or "").strip().lower() in ACTIVE_RUN_STATUSES]
-
-
-def _active_jobs(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if str(row.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES]
-
-
-def _active_subagents(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [row for row in rows if str(row.get("status") or "").strip().lower() in ACTIVE_SUBAGENT_STATUSES]
-
-
 def collect_snapshot(limit: int = 8) -> dict[str, Any]:
-    runs = list_capability_runs(limit=max(20, limit * 4))
-    jobs = list_jobs(limit=max(20, limit * 4), active_only=False)
-    subagents = _load_task_meta()
-    return {
-        "generated_at_unix": int(time.time()),
-        "capability_runs": runs,
-        "background_jobs": jobs,
-        "subagent_tasks": subagents,
-        "run_counts": _status_counts(runs),
-        "job_counts": _status_counts(jobs),
-        "subagent_counts": _status_counts(subagents),
-        "active_runs": _active_runs(runs)[:limit],
-        "active_jobs": _active_jobs(jobs)[:limit],
-        "active_subagents": _active_subagents(subagents)[:limit],
-    }
+    return build_operational_task_snapshot(limit=max(1, limit))
 
 
 def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
-    run_counts = snapshot.get("run_counts") or {}
-    job_counts = snapshot.get("job_counts") or {}
-    subagent_counts = snapshot.get("subagent_counts") or {}
-    active_runs = snapshot.get("active_runs") or []
-    active_jobs = snapshot.get("active_jobs") or []
-    active_subagents = snapshot.get("active_subagents") or []
+    counts = snapshot.get("counts") if isinstance(snapshot.get("counts"), dict) else {}
+    run_counts = counts.get("capability_runs") if isinstance(counts.get("capability_runs"), dict) else {}
+    job_counts = counts.get("background_jobs") if isinstance(counts.get("background_jobs"), dict) else {}
+    subagent_counts = counts.get("delegation_tasks") if isinstance(counts.get("delegation_tasks"), dict) else {}
+    units = snapshot.get("units") if isinstance(snapshot.get("units"), list) else []
+
+    active_runs = [unit for unit in units if unit.get("unit_type") == "capability_run" and str(unit.get("status") or "") in {"queued", "running", "pending_approval", "blocked", "paused"}]
+    active_jobs = [unit for unit in units if unit.get("unit_type") == "background_job" and str(unit.get("status") or "") in {"queued", "running", "paused", "blocked"}]
+    active_subagents = [unit for unit in units if unit.get("unit_type") == "delegation_task" and str(unit.get("status") or "") in {"created", "running"}]
 
     lines = ["统一运行任务总览", ""]
     lines.append("一、能力运行（capability runs）")
@@ -79,8 +43,8 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     lines.append(f"- 活跃数: {len(active_runs)}")
     for row in active_runs[:limit]:
         lines.append(
-            f"  - {str(row.get('run_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
-            f"{_short(row.get('title') or row.get('goal') or '-', 90)}"
+            f"  - {str(row.get('related_ids', {}).get('run_id') or row.get('unit_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
+            f"{_short(row.get('title') or '-', 90)}"
         )
 
     lines.extend(["", "二、后台任务（background jobs）"])
@@ -89,18 +53,18 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     lines.append(f"- 活跃数: {len(active_jobs)}")
     for row in active_jobs[:limit]:
         lines.append(
-            f"  - {str(row.get('job_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
+            f"  - {str(row.get('related_ids', {}).get('job_id') or row.get('unit_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
             f"{_short(row.get('title') or '-', 90)}"
         )
 
     lines.extend(["", "三、子智能体任务（delegation tasks）"])
-    lines.append(f"- 总数: {len(snapshot.get('subagent_tasks') or [])}")
+    lines.append(f"- 总数: {len(snapshot.get('delegation_tasks') or [])}")
     lines.append(f"- 状态分布: {subagent_counts or {'none': 0}}")
     lines.append(f"- 活跃数: {len(active_subagents)}")
     for row in active_subagents[:limit]:
         lines.append(
-            f"  - {str(row.get('status') or '-').strip()} | {str(row.get('worker_role') or 'generic').strip()} | "
-            f"{_short(row.get('goal') or '-', 90)}"
+            f"  - {str(row.get('status') or '-').strip()} | {str(row.get('owner') or 'generic').strip()} | "
+            f"{_short(row.get('title') or '-', 90)}"
         )
 
     lines.extend(["", "四、系统判断"])
