@@ -42,9 +42,17 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     lines.append(f"- 状态分布: {run_counts or {'none': 0}}")
     lines.append(f"- 活跃数: {len(active_runs)}")
     for row in active_runs[:limit]:
+        scope_bits = []
+        task_scope_key = str(row.get("task_scope_key") or "").strip()
+        person_memory_key = str(row.get("person_memory_key") or "").strip()
+        if task_scope_key:
+            scope_bits.append(f"task_scope={task_scope_key}")
+        if person_memory_key:
+            scope_bits.append(f"person_memory={person_memory_key}")
+        scope_suffix = f" | {' | '.join(scope_bits)}" if scope_bits else ""
         lines.append(
             f"  - {str(row.get('related_ids', {}).get('run_id') or row.get('unit_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
-            f"{_short(row.get('title') or '-', 90)}"
+            f"{_short(row.get('title') or '-', 90)}{scope_suffix}"
         )
 
     lines.extend(["", "二、后台任务（background jobs）"])

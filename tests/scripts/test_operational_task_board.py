@@ -40,7 +40,15 @@ def test_build_report_highlights_distributed_task_state():
         },
         "units": [
             {"unit_id": "subagent:deleg-1", "unit_type": "delegation_task", "status": "created", "owner": "ops-worker", "title": "Check watchdog chain"},
-            {"unit_id": "run:run-1", "unit_type": "capability_run", "status": "queued", "title": "Weixin watchdog recovery"},
+            {
+                "unit_id": "run:run-1",
+                "unit_type": "capability_run",
+                "status": "queued",
+                "title": "Weixin watchdog recovery",
+                "task_scope_key": "dingtalk:chat:group-1",
+                "person_memory_key": "dingtalk:user:alice",
+                "related_ids": {"run_id": "run-1"},
+            },
             {"unit_id": "job:job-1", "unit_type": "background_job", "status": "failed", "title": "OpenClaw retry"},
         ],
     }
@@ -51,3 +59,5 @@ def test_build_report_highlights_distributed_task_state():
     assert "状态源仍分散在 capability runs / background jobs / delegation tasks 三层" in report
     assert "背景任务失败较多（failed=1）" in report
     assert "queued=1" in report
+    assert "task_scope=dingtalk:chat:group-1" in report
+    assert "person_memory=dingtalk:user:alice" in report
