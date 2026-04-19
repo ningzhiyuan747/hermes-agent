@@ -24,6 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from hermes_constants import get_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
 from agent.background_jobs import (
     append_job_event,
     claim_next_job,
@@ -38,6 +40,10 @@ try:
     from agent.business_db import update_capability_run
 except Exception:
     update_capability_run = None  # type: ignore[assignment]
+
+
+_HERMES_HOME = get_hermes_home()
+load_hermes_dotenv(hermes_home=_HERMES_HOME, project_env=REPO_ROOT / ".env")
 
 
 MAX_DELIVERY_CHARS = int(os.getenv("HERMES_BACKGROUND_JOB_DELIVERY_CHARS", "3200"))
@@ -87,11 +93,22 @@ def _capability_run_id(job: dict) -> str:
     return ""
 
 
+def _scope_payload_from_job(job: dict) -> dict[str, str]:
+    payload: dict[str, str] = {}
+    task_scope_key = _tag_value(job, "task_scope")
+    person_memory_key = _tag_value(job, "person_memory")
+    if task_scope_key:
+        payload["task_scope_key"] = task_scope_key
+    if person_memory_key:
+        payload["person_memory_key"] = person_memory_key
+    return payload
+
+
 def _sync_capability_run_status(job: dict, *, status: str, current_focus: str, next_step: str, result: str = "", blocker: str = "") -> None:
     run_id = _capability_run_id(job)
     if not run_id or update_capability_run is None:
         return
-    payload = {"background_job_status": status}
+    payload = {"background_job_status": status, **_scope_payload_from_job(job)}
     if result:
         payload["background_job_result"] = result
     if blocker:
@@ -133,9 +150,10 @@ def _worker_kind_from_job(job: dict) -> str:
 
 def _tag_value(job: dict, prefix: str) -> str:
     needle = str(prefix or "").strip().lower() + ":"
-    for tag in _job_tags(job):
-        if tag.startswith(needle):
-            return tag.split(":", 1)[1].strip()
+    for raw_tag in (job.get("tags") or []):
+        tag = str(raw_tag or "").strip()
+        if tag.lower().startswith(needle):
+            return tag[len(needle):].strip()
     return ""
 
 

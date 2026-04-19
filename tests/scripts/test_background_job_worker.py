@@ -9,6 +9,7 @@ SCRIPT_PATH = Path(__file__).resolve().parents[2] / "scripts" / "background_job_
 
 
 def load_module():
+    sys.modules.pop("background_job_worker_test", None)
     spec = importlib.util.spec_from_file_location("background_job_worker_test", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -17,7 +18,19 @@ def load_module():
     return module
 
 
+def test_background_job_worker_loads_openclaw_env_from_hermes_home(monkeypatch, tmp_path):
+    env_path = tmp_path / ".env"
+    env_path.write_text("HERMES_OPENCLAW_AGENT=dotenv-agent\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.delenv("HERMES_OPENCLAW_AGENT", raising=False)
+
+    mod = load_module()
+
+    assert mod.OPENCLAW_AGENT == "dotenv-agent"
+
+
 def test_run_openclaw_for_job_uses_popen_pipe_streams(monkeypatch):
+    monkeypatch.setenv("HERMES_OPENCLAW_AGENT", "hermes-research")
     mod = load_module()
     updates: list[dict] = []
 
@@ -80,7 +93,12 @@ def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):
         "job_id": "job-123",
         "title": "demo",
         "status": "running",
-        "tags": ["executor:openclaw", "capability_run:run-123"],
+        "tags": [
+            "executor:openclaw",
+            "capability_run:run-123",
+            "task_scope:feishu:chat:Group-42:thread:Task-9",
+            "person_memory:feishu:user:User-7",
+        ],
     }
 
     monkeypatch.setattr(mod, "claim_next_job", lambda executor: job)
@@ -113,7 +131,12 @@ def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):
             "next_step": "Review the stored result delivered from the background worker.",
             "result": "done",
             "blocker": None,
-            "output": {"background_job_result": "done", "background_job_status": "completed"},
+            "output": {
+                "background_job_result": "done",
+                "background_job_status": "completed",
+                "task_scope_key": "feishu:chat:Group-42:thread:Task-9",
+                "person_memory_key": "feishu:user:User-7",
+            },
         }
     ]
     assert deliveries == [{"record": {"job_id": "job-123", "status": "completed", "current_focus": "Background job completed.", "next_step": "Review the stored result; delivery to the originating chat has been attempted when available.", "result": "done"}, "failed": False}]
