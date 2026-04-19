@@ -12,6 +12,9 @@ from agent.business_db import (
     update_capability_run,
 )
 from agent.capability_snapshots import (
+    build_task_scope_key,
+    extract_background_job_task_scope_key,
+    extract_capability_run_task_scope_key,
     pick_background_job_snapshot,
     pick_capability_run_snapshot,
     resolve_task_binding,
@@ -39,10 +42,12 @@ def get_background_job_snapshot(
     rows = list_jobs(limit=30, active_only=bool(active_only))
     runs = list_capability_runs(status="", limit=100)
     task, task_id = get_task_binding(platform=platform, chat_id=chat_id, thread_id=thread_id)
+    task_scope_key = build_task_scope_key(platform=platform, chat_id=chat_id, thread_id=thread_id, task_id=task_id)
     return pick_background_job_snapshot(
         rows,
         runs,
         session_id=str(session_id or "").strip(),
+        task_scope_key=task_scope_key,
         task_id=task_id,
         task_title=str(task.get("title") or "").strip(),
         global_fallback=bool(global_fallback),
@@ -61,9 +66,11 @@ def get_capability_run_snapshot(
 ) -> Optional[Dict[str, Any]]:
     rows = list_capability_runs(status="", limit=100)
     task, task_id = get_task_binding(platform=platform, chat_id=chat_id, thread_id=thread_id)
+    task_scope_key = build_task_scope_key(platform=platform, chat_id=chat_id, thread_id=thread_id, task_id=task_id)
     return pick_capability_run_snapshot(
         rows,
         session_id=str(session_id or "").strip(),
+        task_scope_key=task_scope_key,
         task_id=task_id,
         task_title=str(task.get("title") or "").strip(),
         active_only=bool(active_only),
@@ -86,6 +93,7 @@ def cancel_background_jobs(
     runs = list_capability_runs(status="", limit=100)
     task, task_id = get_task_binding(platform=platform, chat_id=chat_id, thread_id=thread_id)
     del task
+    task_scope_key = build_task_scope_key(platform=platform, chat_id=chat_id, thread_id=thread_id, task_id=task_id)
     runs_by_id = {
         str(run.get("run_id") or "").strip(): run
         for run in runs
@@ -108,6 +116,12 @@ def cancel_background_jobs(
                     return run
         return None
 
+    def _run_scope_key(run: Dict[str, Any] | None) -> str:
+        return extract_capability_run_task_scope_key(run or {})
+
+    def _job_scope_key(row: Dict[str, Any]) -> str:
+        return extract_background_job_task_scope_key(row)
+
     matches: list[Dict[str, Any]] = []
     for row in rows:
         tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
@@ -115,7 +129,12 @@ def cancel_background_jobs(
             continue
         run = _resolve_run(row)
         run_task_id = str((run or {}).get("task_id") or "").strip()
+        candidate_scope_key = _run_scope_key(run) or _job_scope_key(row)
         session_match = str(row.get("session_id") or "").strip() == str(session_id or "").strip()
+        if task_scope_key and candidate_scope_key:
+            if candidate_scope_key == task_scope_key:
+                matches.append(row)
+            continue
         if task_id:
             if run_task_id != task_id and not (not run_task_id and session_match):
                 continue
@@ -129,10 +148,17 @@ def cancel_background_jobs(
             tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
             if "executor:openclaw" not in tags:
                 continue
+            candidate_scope_key = _job_scope_key(row)
             if task_id:
                 run = _resolve_run(row)
-                if str((run or {}).get("task_id") or "").strip() != task_id:
+                run_scope_key = _run_scope_key(run)
+                if task_scope_key and (run_scope_key or candidate_scope_key):
+                    if (run_scope_key or candidate_scope_key) != task_scope_key:
+                        continue
+                elif str((run or {}).get("task_id") or "").strip() != task_id:
                     continue
+            elif task_scope_key and candidate_scope_key and candidate_scope_key != task_scope_key:
+                continue
             fallback_rows.append(row)
         fallback_rows.sort(key=lambda item: int(item.get("updated_at_unix") or 0), reverse=True)
         matches = fallback_rows[:1]

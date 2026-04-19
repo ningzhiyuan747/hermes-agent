@@ -6,6 +6,60 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 ACTIVE_RUN_STATUSES = {"queued", "running", "pending_approval", "blocked", "paused"}
 
 
+def build_task_scope_key(
+    *,
+    platform: str = "",
+    chat_id: str = "",
+    thread_id: str = "",
+    task_id: str = "",
+) -> str:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_chat_id = str(chat_id or "").strip()
+    normalized_thread_id = str(thread_id or "").strip()
+    normalized_task_id = str(task_id or "").strip()
+    if normalized_platform and normalized_chat_id:
+        task_scope_key = f"{normalized_platform}:chat:{normalized_chat_id}"
+        if normalized_thread_id:
+            task_scope_key += f":thread:{normalized_thread_id}"
+        return task_scope_key
+    if normalized_task_id:
+        return f"task:{normalized_task_id}"
+    return ""
+
+
+def _payload_task_scope_key(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return ""
+    return str(payload.get("task_scope_key") or "").strip()
+
+
+def extract_capability_run_task_scope_key(row: Dict[str, Any]) -> str:
+    return (
+        str(row.get("task_scope_key") or "").strip()
+        or _payload_task_scope_key(row.get("output"))
+        or _payload_task_scope_key(row.get("input"))
+    )
+
+
+def _job_tag_value(tags: List[str], prefix: str) -> str:
+    expected = f"{str(prefix or '').strip().lower()}:"
+    if not expected or expected == ":":
+        return ""
+    for tag in tags:
+        if tag.startswith(expected) and tag.split(":", 1)[1]:
+            return tag.split(":", 1)[1].strip()
+    return ""
+
+
+def extract_background_job_task_scope_key(row: Dict[str, Any]) -> str:
+    tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
+    return (
+        str(row.get("task_scope_key") or "").strip()
+        or _job_tag_value(tags, "task_scope")
+        or _payload_task_scope_key(row.get("payload"))
+    )
+
+
 def resolve_task_binding(
     *,
     platform: str,
@@ -82,16 +136,61 @@ def _find_capability_run_for_job(
     *,
     runs: List[Dict[str, Any]],
 ) -> Optional[Dict[str, Any]]:
-    for tag in tags:
-        if tag.startswith("capability_run:") and tag.split(":", 1)[1]:
-            wanted = tag.split(":", 1)[1].strip()
-            for item in runs:
-                if str(item.get("run_id") or "").strip() == wanted:
-                    return item
+    wanted = _job_tag_value(tags, "capability_run")
+    if wanted:
+        for item in runs:
+            if str(item.get("run_id") or "").strip() == wanted:
+                return item
     for item in runs:
         if str(item.get("background_job_id") or "").strip() == str(job_id or "").strip():
             return item
     return None
+
+
+def _scope_matches(*, wanted_scope_key: str, candidate_scope_key: str) -> bool:
+    normalized_wanted = str(wanted_scope_key or "").strip()
+    normalized_candidate = str(candidate_scope_key or "").strip()
+    return bool(normalized_wanted and normalized_candidate and normalized_candidate == normalized_wanted)
+
+
+def _matches_task_or_session(
+    *,
+    task_id: str,
+    payload_task_id: str,
+    session_match: bool,
+) -> bool:
+    if task_id:
+        return bool(payload_task_id == task_id or (not payload_task_id and session_match))
+    return session_match
+
+
+def _global_fallback_match(
+    *,
+    task_scope_key: str,
+    candidate_scope_key: str,
+    task_id: str,
+    payload_task_id: str,
+) -> bool:
+    if _scope_matches(wanted_scope_key=task_scope_key, candidate_scope_key=candidate_scope_key):
+        return True
+    if task_id:
+        return payload_task_id == task_id
+    return not task_scope_key
+
+
+def _apply_scope_metadata(
+    payload: Dict[str, Any],
+    *,
+    task_id: str = "",
+    task_title: str = "",
+    task_scope_key: str = "",
+) -> Dict[str, Any]:
+    if task_id:
+        payload["task_id"] = task_id
+        payload["task_title"] = task_title
+    if task_scope_key:
+        payload["task_scope_key"] = task_scope_key
+    return payload
 
 
 def enrich_background_job_payload(
@@ -104,15 +203,18 @@ def enrich_background_job_payload(
     tags = [str(item).strip().lower() for item in (record.get("tags") or []) if str(item).strip()]
     record["tags"] = tags
     record["trace_id"] = str(record.get("trace_id") or "").strip()
+    record["task_scope_key"] = extract_background_job_task_scope_key(record)
     run = _find_capability_run_for_job(record, tags, str(record.get("job_id") or "").strip(), runs=runs)
     if run is None:
         return record
     run_id = str(run.get("run_id") or "").strip()
+    run_task_scope_key = extract_capability_run_task_scope_key(run)
     record.update(
         {
             "trace_id": str(run.get("trace_id") or "").strip() or str(record.get("trace_id") or "").strip(),
             "capability_run_id": run_id,
             "task_id": str(run.get("task_id") or "").strip(),
+            "task_scope_key": run_task_scope_key or str(record.get("task_scope_key") or "").strip(),
             "capability_name": str(run.get("capability_name") or "").strip(),
             "capability_status": str(run.get("status") or "").strip(),
             "approval_id": str(run.get("approval_id") or "").strip(),
@@ -134,6 +236,7 @@ def pick_background_job_snapshot(
     runs: List[Dict[str, Any]],
     *,
     session_id: str,
+    task_scope_key: str = "",
     task_id: str = "",
     task_title: str = "",
     global_fallback: bool = False,
@@ -149,17 +252,35 @@ def pick_background_job_snapshot(
             runs=runs,
             list_capability_artifacts_func=list_capability_artifacts_func,
         )
+        payload_scope_key = str(payload.get("task_scope_key") or "").strip()
         payload_task_id = str(payload.get("task_id") or "").strip()
         session_match = str(payload.get("session_id") or "").strip() == session_id
-        task_match = bool(task_id and payload_task_id == task_id)
-        if task_id:
-            if not task_match and not (not payload_task_id and session_match):
-                continue
-            payload["task_id"] = task_id
-            payload["task_title"] = task_title
-        elif not session_match:
+        if _scope_matches(wanted_scope_key=task_scope_key, candidate_scope_key=payload_scope_key):
+            matches.append(
+                _apply_scope_metadata(
+                    payload,
+                    task_id=task_id,
+                    task_title=task_title,
+                    task_scope_key=task_scope_key,
+                )
+            )
             continue
-        matches.append(payload)
+        if payload_scope_key and task_scope_key:
+            continue
+        if not _matches_task_or_session(
+            task_id=task_id,
+            payload_task_id=payload_task_id,
+            session_match=session_match,
+        ):
+            continue
+        matches.append(
+            _apply_scope_metadata(
+                payload,
+                task_id=task_id,
+                task_title=task_title,
+                task_scope_key=task_scope_key,
+            )
+        )
     if not matches and global_fallback:
         for row in rows:
             tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
@@ -171,12 +292,21 @@ def pick_background_job_snapshot(
                 list_capability_artifacts_func=list_capability_artifacts_func,
             )
             payload["shared_scope"] = "global"
-            if task_id:
-                if str(payload.get("task_id") or "").strip() != task_id:
-                    continue
-                payload["task_id"] = task_id
-                payload["task_title"] = task_title
-            matches.append(payload)
+            if not _global_fallback_match(
+                task_scope_key=task_scope_key,
+                candidate_scope_key=str(payload.get("task_scope_key") or "").strip(),
+                task_id=task_id,
+                payload_task_id=str(payload.get("task_id") or "").strip(),
+            ):
+                continue
+            matches.append(
+                _apply_scope_metadata(
+                    payload,
+                    task_id=task_id,
+                    task_title=task_title,
+                    task_scope_key=task_scope_key,
+                )
+            )
     matches.sort(key=lambda item: int(item.get("updated_at_unix") or 0), reverse=True)
     return matches[0] if matches else None
 
@@ -185,6 +315,7 @@ def pick_capability_run_snapshot(
     rows: List[Dict[str, Any]],
     *,
     session_id: str,
+    task_scope_key: str = "",
     task_id: str = "",
     task_title: str = "",
     active_only: bool = True,
@@ -197,35 +328,56 @@ def pick_capability_run_snapshot(
         if active_only and status not in ACTIVE_RUN_STATUSES:
             continue
         row_task_id = str(row.get("task_id") or "").strip()
+        row_task_scope_key = extract_capability_run_task_scope_key(row)
         session_match = str(row.get("session_id") or "").strip() == session_id
-        if task_id:
-            if row_task_id != task_id and not (not row_task_id and session_match):
-                continue
-        elif not session_match:
-            continue
-        matches.append(
-            enrich_capability_run_payload(
+        if _scope_matches(wanted_scope_key=task_scope_key, candidate_scope_key=row_task_scope_key):
+            payload = enrich_capability_run_payload(
                 dict(row),
                 task_id=task_id,
                 task_title=task_title,
                 list_capability_artifacts_func=list_capability_artifacts_func,
             )
+            payload["task_scope_key"] = task_scope_key
+            matches.append(payload)
+            continue
+        if row_task_scope_key and task_scope_key:
+            continue
+        if not _matches_task_or_session(
+            task_id=task_id,
+            payload_task_id=row_task_id,
+            session_match=session_match,
+        ):
+            continue
+        payload = enrich_capability_run_payload(
+            dict(row),
+            task_id=task_id,
+            task_title=task_title,
+            list_capability_artifacts_func=list_capability_artifacts_func,
         )
+        if task_scope_key:
+            payload["task_scope_key"] = task_scope_key
+        matches.append(payload)
     if not matches and global_fallback:
         for row in rows:
             status = str(row.get("status") or "").strip().lower()
             if active_only and status not in ACTIVE_RUN_STATUSES:
                 continue
-            if task_id and str(row.get("task_id") or "").strip() != task_id:
+            if not _global_fallback_match(
+                task_scope_key=task_scope_key,
+                candidate_scope_key=extract_capability_run_task_scope_key(row),
+                task_id=task_id,
+                payload_task_id=str(row.get("task_id") or "").strip(),
+            ):
                 continue
-            matches.append(
-                enrich_capability_run_payload(
-                    dict(row),
-                    task_id=task_id,
-                    task_title=task_title,
-                    shared_scope="global",
-                    list_capability_artifacts_func=list_capability_artifacts_func,
-                )
+            payload = enrich_capability_run_payload(
+                dict(row),
+                task_id=task_id,
+                task_title=task_title,
+                shared_scope="global",
+                list_capability_artifacts_func=list_capability_artifacts_func,
             )
+            if task_scope_key:
+                payload["task_scope_key"] = task_scope_key
+            matches.append(payload)
     matches.sort(key=lambda item: int(item.get("updated_at_unix") or 0), reverse=True)
     return matches[0] if matches else None
