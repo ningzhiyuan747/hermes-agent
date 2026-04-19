@@ -257,8 +257,28 @@ class FeishuCapabilityBridgeConfig:
 
 
 class FeishuCapabilityBridge:
-    def __init__(self, config: FeishuCapabilityBridgeConfig) -> None:
-        self._config = config
+    def __init__(self, config: FeishuCapabilityBridgeConfig | None = None) -> None:
+        self.config = config or FeishuCapabilityBridgeConfig(
+            offload_enabled=False,
+            offload_capabilities=frozenset(),
+        )
+
+    @staticmethod
+    def _scope_fields(*, platform: str, chat_id: str, thread_id: str, actor_user_id: str) -> Dict[str, str]:
+        platform_value = str(platform or "").strip().lower()
+        chat_value = str(chat_id or "").strip()
+        thread_value = str(thread_id or "").strip()
+        actor_value = str(actor_user_id or "").strip()
+        task_scope_key = ""
+        if platform_value and chat_value:
+            task_scope_key = f"{platform_value}:chat:{chat_value}"
+            if thread_value:
+                task_scope_key += f":thread:{thread_value}"
+        person_memory_key = f"{platform_value}:user:{actor_value}" if platform_value and actor_value else ""
+        return {
+            "task_scope_key": task_scope_key,
+            "person_memory_key": person_memory_key,
+        }
 
     def build_effective_question(self, question: str) -> str:
         route = detect_capability_route(question)
@@ -281,11 +301,11 @@ class FeishuCapabilityBridge:
         return "\n\n".join(parts)
 
     def route_prefers_openclaw(self, route: Optional[Dict[str, str]]) -> bool:
-        if not self._config.offload_enabled or not route:
+        if not self.config.offload_enabled or not route:
             return False
         capability = str(route.get("capability") or "").strip().lower()
         executor = str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower()
-        return executor == "openclaw" and capability in self._config.offload_capabilities
+        return executor == "openclaw" and capability in self.config.offload_capabilities
 
     def create_capability_run_for_route(
         self,
@@ -304,19 +324,27 @@ class FeishuCapabilityBridge:
             "chat_type": str(event.source.chat_type or "").strip(),
             "thread_id": str(event.source.thread_id or "").strip(),
         }
+        actor_user_id = str(event.source.user_id or getattr(event.source, "user_id_alt", "") or "").strip()
+        scopes = self._scope_fields(
+            platform="feishu",
+            chat_id=origin["chat_id"],
+            thread_id=origin["thread_id"],
+            actor_user_id=actor_user_id,
+        )
         try:
             return create_capability_run_func(
                 capability=str(route.get("capability") or "").strip(),
                 title=str(route.get("title") or (event.text or "")[:80]).strip(),
                 goal=str(event.text or "").strip(),
                 origin=origin,
-                actor_user_id=str(event.source.user_id or getattr(event.source, "user_id_alt", "") or "").strip(),
+                actor_user_id=actor_user_id,
                 session_id=session_key_builder(event),
                 priority="normal",
                 input_data={
                     "message_id": str(event.message_id or "").strip(),
                     "worker_kind": str(route.get("worker_kind") or "").strip().lower(),
                     "executor": str(route.get("executor") or "hermes").strip().lower(),
+                    **scopes,
                 },
             )
         except Exception as exc:
@@ -344,12 +372,19 @@ class FeishuCapabilityBridge:
             "chat_type": str(event.source.chat_type or "").strip(),
             "thread_id": str(event.source.thread_id or "").strip(),
         }
+        actor_user_id = str(event.source.user_id or getattr(event.source, "user_id_alt", "") or "").strip()
+        scopes = self._scope_fields(
+            platform="feishu",
+            chat_id=origin["chat_id"],
+            thread_id=origin["thread_id"],
+            actor_user_id=actor_user_id,
+        )
         record = create_job_func(
             title=str(route.get("title") or ((event.text or "")[:80])).strip(),
             prompt=prompt,
             origin=origin,
             session_id=session_key,
-            user_id=str(event.source.user_id or getattr(event.source, "user_id_alt", "") or "").strip(),
+            user_id=actor_user_id,
             priority="normal",
             trace_id=str((run_record or {}).get("trace_id") or "").strip() or _new_trace_id(),
             executor=str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower(),
@@ -367,6 +402,16 @@ class FeishuCapabilityBridge:
             + (
                 [f"openclaw_agent:{str(route.get('openclaw_agent') or '').strip()}"]
                 if str(route.get("openclaw_agent") or "").strip()
+                else []
+            )
+            + (
+                [f"task_scope:{str(scopes.get('task_scope_key') or '').strip()}"]
+                if str(scopes.get("task_scope_key") or "").strip()
+                else []
+            )
+            + (
+                [f"person_memory:{str(scopes.get('person_memory_key') or '').strip()}"]
+                if str(scopes.get("person_memory_key") or "").strip()
                 else []
             )
             + (
@@ -388,6 +433,7 @@ class FeishuCapabilityBridge:
                         "background_job_id": str(record.get("job_id") or "").strip(),
                         "route_mode": str(route.get("mode") or "guided").strip().lower(),
                         "worker_kind": str(route.get("worker_kind") or "").strip().lower(),
+                        **scopes,
                     },
                 )
             except Exception:
