@@ -18,15 +18,64 @@ def _status_counts(rows: list[dict[str, Any]], key: str = "status") -> dict[str,
     return dict(sorted(counter.items(), key=lambda item: (-item[1], item[0])))
 
 
+def _build_scope_fields(
+    *,
+    origin: dict[str, Any] | None,
+    actor_user_id: str = "",
+    task_id: str = "",
+) -> dict[str, str]:
+    origin = origin if isinstance(origin, dict) else {}
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    thread_id = str(origin.get("thread_id") or "").strip()
+    actor_user_id = str(actor_user_id or "").strip()
+    task_id = str(task_id or "").strip()
+
+    task_scope_key = ""
+    if platform and chat_id:
+        task_scope_key = f"{platform}:chat:{chat_id}"
+        if thread_id:
+            task_scope_key += f":thread:{thread_id}"
+    elif task_id:
+        task_scope_key = f"task:{task_id}"
+
+    person_memory_key = ""
+    if platform and actor_user_id:
+        person_memory_key = f"{platform}:user:{actor_user_id}"
+    elif actor_user_id:
+        person_memory_key = f"user:{actor_user_id}"
+
+    if platform == "dingtalk" and chat_id:
+        conversation_role = "task_group"
+    elif chat_id:
+        conversation_role = "chat_surface"
+    elif task_id:
+        conversation_role = "task_unit"
+    else:
+        conversation_role = "system"
+
+    return {
+        "origin_chat_id": chat_id,
+        "origin_thread_id": thread_id,
+        "actor_user_id": actor_user_id,
+        "task_scope_key": task_scope_key,
+        "person_memory_key": person_memory_key,
+        "conversation_role": conversation_role,
+    }
+
+
 def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
     origin = row.get("origin") if isinstance(row.get("origin"), dict) else {}
     run_id = str(row.get("run_id") or "").strip()
+    actor_user_id = str(row.get("actor_user_id") or "").strip()
+    task_id = str(row.get("task_id") or "").strip()
+    scopes = _build_scope_fields(origin=origin, actor_user_id=actor_user_id, task_id=task_id)
     return {
         "unit_id": f"run:{run_id}",
         "unit_type": "capability_run",
         "title": str(row.get("title") or row.get("goal") or "").strip(),
         "status": str(row.get("status") or "unknown").strip().lower(),
-        "owner": str(row.get("session_id") or row.get("actor_user_id") or "").strip(),
+        "owner": str(row.get("session_id") or actor_user_id or "").strip(),
         "origin_platform": str(origin.get("platform") or "").strip().lower(),
         "current_focus": str(row.get("current_focus") or "").strip(),
         "next_step": str(row.get("next_step") or "").strip(),
@@ -35,10 +84,11 @@ def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
         "priority_hint": 100 if str(row.get("status") or "").strip().lower() in ACTIVE_RUN_STATUSES else 10,
         "related_ids": {
             "run_id": run_id,
-            "task_id": str(row.get("task_id") or "").strip(),
+            "task_id": task_id,
             "background_job_id": str(row.get("background_job_id") or "").strip(),
             "approval_id": str(row.get("approval_id") or "").strip(),
         },
+        **scopes,
         "raw": row,
     }
 
