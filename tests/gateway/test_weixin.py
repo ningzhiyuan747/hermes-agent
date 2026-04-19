@@ -5,10 +5,17 @@ import json
 import os
 from unittest.mock import AsyncMock, patch
 
+import pytest
+
 from gateway.config import PlatformConfig
 from gateway.config import GatewayConfig, HomeChannel, Platform, _apply_env_overrides
 from gateway.platforms import weixin
-from gateway.platforms.weixin import ContextTokenStore, WeixinAdapter
+from gateway.platforms.base import MessageType
+from gateway.platforms.weixin import (
+    ContextTokenStore,
+    WeixinAdapter,
+    normalize_weixin_gateway_command_text,
+)
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
 
 
@@ -61,6 +68,64 @@ class TestWeixinFormatting:
         adapter = _make_adapter()
 
         assert adapter.format_message(None) == ""
+
+
+class TestWeixinGatewayCommandNormalization:
+    def test_normalize_weixin_gateway_command_text_maps_stop_aliases(self):
+        assert normalize_weixin_gateway_command_text("停止") == "/stop"
+        assert normalize_weixin_gateway_command_text("停一下先") == "/stop"
+
+    def test_normalize_weixin_gateway_command_text_maps_status_aliases(self):
+        assert normalize_weixin_gateway_command_text("状态") == "/status"
+
+    def test_normalize_weixin_gateway_command_text_does_not_rewrite_questions(self):
+        assert normalize_weixin_gateway_command_text("为什么停止不了") == "为什么停止不了"
+
+    @pytest.mark.asyncio
+    async def test_process_message_rewrites_stop_text_to_command_event(self):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._maybe_fetch_typing_ticket = AsyncMock()
+
+        message = {
+            "message_id": "msg-1",
+            "from_user_id": "wxid_user_1",
+            "to_user_id": adapter._account_id,
+            "msg_type": 1,
+            "context_token": "ctx-1",
+            "item_list": [
+                {
+                    "type": weixin.ITEM_TEXT,
+                    "text_item": {"text": "停止"},
+                }
+            ],
+        }
+
+        await adapter._process_message(message)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text == "/stop"
+        assert event.message_type == MessageType.COMMAND
+
+
+class TestWeixinAuthorizationModes:
+    def test_pairing_policy_allows_unknown_dm_to_reach_gateway(self):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "dm_policy": "pairing",
+                    "allow_from": "owner-user",
+                },
+            )
+        )
+
+        assert adapter._is_dm_allowed("friend-user") is True
+        assert adapter._is_dm_allowed("owner-user") is True
 
 
 class TestWeixinChunking:

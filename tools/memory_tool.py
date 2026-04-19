@@ -56,6 +56,19 @@ def get_memory_dir() -> Path:
 
 ENTRY_DELIMITER = "\n§\n"
 
+_PRIVATE_CHAT_TYPES = {
+    "dm",
+    "direct",
+    "direct_message",
+    "private",
+    "im",
+    "1:1",
+    "1",
+    "p2p",
+    "single",
+    "singlechat",
+}
+
 
 # ---------------------------------------------------------------------------
 # Memory content scanning — lightweight check for injection/exfiltration
@@ -98,6 +111,273 @@ def _scan_memory_content(content: str) -> Optional[str]:
     for pattern, pid in _MEMORY_THREAT_PATTERNS:
         if re.search(pattern, content, re.IGNORECASE):
             return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
+
+    return None
+
+
+def _get_session_env(name: str, default: str = "") -> str:
+    try:
+        from gateway.session_context import get_session_env
+        return get_session_env(name, default) or default
+    except Exception:
+        return os.getenv(name, default)
+
+
+def _get_bound_task_id(platform: str, chat_id: str, thread_id: str = "") -> str:
+    if not platform or not chat_id:
+        return ""
+    try:
+        from agent.business_db import get_channel_task
+
+        binding = get_channel_task(platform=platform, chat_id=chat_id, thread_id=thread_id)
+        task = (binding or {}).get("task") or {}
+        return str(task.get("task_id") or "").strip()
+    except Exception:
+        return ""
+
+
+def _build_scoped_memory_summary(entries: List[str]) -> str:
+    if not entries:
+        return ""
+    if len(entries) == 1:
+        return entries[0][:400]
+    latest = entries[-1][:220]
+    return f"{len(entries)} 条记忆；最新：{latest}"
+
+
+def _char_limit_for_target(target: str, store: Optional["MemoryStore"]) -> int:
+    if target == "user":
+        return int(getattr(store, "user_char_limit", 1375) or 1375)
+    return int(getattr(store, "memory_char_limit", 2200) or 2200)
+
+
+def _resolve_scoped_memory_target(target: str) -> Dict[str, str]:
+    platform = str(_get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
+    if not platform:
+        return {}
+
+    chat_type = str(_get_session_env("HERMES_SESSION_CHAT_TYPE", "") or "").strip().lower()
+    user_id = str(_get_session_env("HERMES_SESSION_USER_ID", "") or "").strip()
+    chat_id = str(_get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    thread_id = str(_get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip()
+    is_private = chat_type in _PRIVATE_CHAT_TYPES
+    task_id = "" if is_private else _get_bound_task_id(platform, chat_id, thread_id)
+    if is_private and user_id:
+        return {
+            "kind": "user",
+            "platform": platform,
+            "user_id": user_id,
+            "scope": "profile" if target == "user" else "notes",
+            "chat_type": chat_type,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+    if task_id and target == "memory":
+        return {
+            "kind": "task",
+            "task_id": task_id,
+            "platform": platform,
+            "chat_type": chat_type,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+        }
+    return {
+        "kind": "blocked",
+        "platform": platform,
+        "chat_type": chat_type,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "user_id": user_id,
+        "task_id": task_id,
+    }
+
+
+def _load_scoped_entries(target_info: Dict[str, str]) -> List[str]:
+    try:
+        from agent.business_db import get_task_memory, get_user_memory
+
+        if target_info.get("kind") == "user":
+            record = get_user_memory(
+                platform=target_info.get("platform", ""),
+                user_id=target_info.get("user_id", ""),
+                scope=target_info.get("scope", "profile"),
+            )
+        elif target_info.get("kind") == "task":
+            record = get_task_memory(
+                task_id=target_info.get("task_id", ""),
+                scope="shared",
+            )
+        else:
+            return []
+    except Exception:
+        return []
+    memory = (record or {}).get("memory") or {}
+    entries = memory.get("entries") if isinstance(memory, dict) else None
+    return [str(item).strip() for item in (entries or []) if str(item).strip()]
+
+
+def _save_scoped_entries(target: str, target_info: Dict[str, str], entries: List[str]) -> None:
+    payload = {
+        "target": target,
+        "entries": entries,
+        "entry_count": len(entries),
+        "session": {
+            "platform": target_info.get("platform", ""),
+            "chat_id": target_info.get("chat_id", ""),
+            "thread_id": target_info.get("thread_id", ""),
+            "chat_type": target_info.get("chat_type", ""),
+            "user_id": target_info.get("user_id", ""),
+        },
+    }
+    summary = _build_scoped_memory_summary(entries)
+    from agent.business_db import upsert_task_memory, upsert_user_memory
+
+    if target_info.get("kind") == "user":
+        upsert_user_memory(
+            platform=target_info.get("platform", ""),
+            user_id=target_info.get("user_id", ""),
+            scope=target_info.get("scope", "profile"),
+            summary=summary,
+            memory=payload,
+        )
+        return
+
+    if target_info.get("kind") == "task":
+        upsert_task_memory(
+            task_id=target_info.get("task_id", ""),
+            scope="shared",
+            summary=summary,
+            memory=payload,
+        )
+
+
+def _scoped_success_response(target: str, entries: List[str], limit: int, message: str = None) -> Dict[str, Any]:
+    current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+    pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
+    result = {
+        "success": True,
+        "target": target,
+        "entries": entries,
+        "usage": f"{pct}% — {current:,}/{limit:,} chars",
+        "entry_count": len(entries),
+    }
+    if message:
+        result["message"] = message
+    return result
+
+
+def _apply_scoped_memory_action(
+    *,
+    action: str,
+    target: str,
+    content: str = None,
+    old_text: str = None,
+    store: Optional["MemoryStore"] = None,
+) -> Optional[Dict[str, Any]]:
+    target_info = _resolve_scoped_memory_target(target)
+    kind = target_info.get("kind")
+    if not kind:
+        return None
+
+    if kind == "blocked":
+        if target == "user":
+            return {
+                "success": False,
+                "error": "User profile memory can only be written inside a private 1:1 conversation.",
+            }
+        return {
+            "success": False,
+            "error": "Shared-chat durable memory requires a bound task. Bind the current group to a task first, or save this in a private chat.",
+        }
+
+    entries = _load_scoped_entries(target_info)
+    limit = _char_limit_for_target(target, store)
+
+    if action == "add":
+        content = str(content or "").strip()
+        if not content:
+            return {"success": False, "error": "Content cannot be empty."}
+        scan_error = _scan_memory_content(content)
+        if scan_error:
+            return {"success": False, "error": scan_error}
+        if content in entries:
+            return _scoped_success_response(target, entries, limit, "Entry already exists (no duplicate added).")
+        new_entries = entries + [content]
+        new_total = len(ENTRY_DELIMITER.join(new_entries))
+        if new_total > limit:
+            current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+            return {
+                "success": False,
+                "error": (
+                    f"Memory at {current:,}/{limit:,} chars. "
+                    f"Adding this entry ({len(content)} chars) would exceed the limit. "
+                    f"Replace or remove existing entries first."
+                ),
+                "current_entries": entries,
+                "usage": f"{current:,}/{limit:,}",
+            }
+        _save_scoped_entries(target, target_info, new_entries)
+        return _scoped_success_response(target, new_entries, limit, "Entry added.")
+
+    if action == "replace":
+        old_text = str(old_text or "").strip()
+        content = str(content or "").strip()
+        if not old_text:
+            return {"success": False, "error": "old_text cannot be empty."}
+        if not content:
+            return {"success": False, "error": "Content cannot be empty."}
+        scan_error = _scan_memory_content(content)
+        if scan_error:
+            return {"success": False, "error": scan_error}
+        matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
+        if not matches:
+            return {"success": False, "error": f"No entry matched '{old_text}'."}
+        if len(matches) > 1:
+            unique_texts = set(e for _, e in matches)
+            if len(unique_texts) > 1:
+                previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
+                return {
+                    "success": False,
+                    "error": f"Multiple entries matched '{old_text}'. Be more specific.",
+                    "matches": previews,
+                }
+        new_entries = list(entries)
+        new_entries[matches[0][0]] = content
+        new_total = len(ENTRY_DELIMITER.join(new_entries)) if new_entries else 0
+        if new_total > limit:
+            current = len(ENTRY_DELIMITER.join(entries)) if entries else 0
+            return {
+                "success": False,
+                "error": (
+                    f"Memory at {current:,}/{limit:,} chars. "
+                    f"Replacing with this entry ({len(content)} chars) would exceed the limit."
+                ),
+                "current_entries": entries,
+                "usage": f"{current:,}/{limit:,}",
+            }
+        _save_scoped_entries(target, target_info, new_entries)
+        return _scoped_success_response(target, new_entries, limit, "Entry replaced.")
+
+    if action == "remove":
+        old_text = str(old_text or "").strip()
+        if not old_text:
+            return {"success": False, "error": "old_text cannot be empty."}
+        matches = [(i, e) for i, e in enumerate(entries) if old_text in e]
+        if not matches:
+            return {"success": False, "error": f"No entry matched '{old_text}'."}
+        if len(matches) > 1:
+            unique_texts = set(e for _, e in matches)
+            if len(unique_texts) > 1:
+                previews = [e[:80] + ("..." if len(e) > 80 else "") for _, e in matches]
+                return {
+                    "success": False,
+                    "error": f"Multiple entries matched '{old_text}'. Be more specific.",
+                    "matches": previews,
+                }
+        new_entries = list(entries)
+        new_entries.pop(matches[0][0])
+        _save_scoped_entries(target, target_info, new_entries)
+        return _scoped_success_response(target, new_entries, limit, "Entry removed.")
 
     return None
 
@@ -478,6 +758,16 @@ def memory_tool(
     if target not in ("memory", "user"):
         return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
 
+    scoped_result = _apply_scoped_memory_action(
+        action=action,
+        target=target,
+        content=content,
+        old_text=old_text,
+        store=store,
+    )
+    if scoped_result is not None:
+        return json.dumps(scoped_result, ensure_ascii=False)
+
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
@@ -578,7 +868,3 @@ registry.register(
     check_fn=check_memory_requirements,
     emoji="🧠",
 )
-
-
-
-

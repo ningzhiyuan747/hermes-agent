@@ -26,6 +26,8 @@ import logging
 import mimetypes
 import os
 import re
+import signal
+import subprocess
 import threading
 import time
 import uuid
@@ -105,8 +107,76 @@ from gateway.platforms.base import (
     cache_audio_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.platforms.adapter_context import build_adapter_context_for_event
+from gateway.platforms.capability_route_service import CapabilityRouteService, CapabilityRouteServiceDeps
+from gateway.platforms.feishu_control_router import FeishuControlRouter, FeishuControlRouterDeps
+from gateway.platforms.feishu_capability_bridge import (
+    FeishuCapabilityBridge,
+    FeishuCapabilityBridgeConfig,
+    detect_capability_route,
+)
+from gateway.platforms.feishu_status_service import FeishuStatusService, FeishuStatusServiceDeps
+from gateway.session import build_session_key
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_constants import get_hermes_home
+
+try:
+    from agent.background_jobs import append_job_event, create_job, list_jobs, update_job
+    from agent.business_command_service import dispatch_business_text_command
+    from agent.business_db import (
+        bind_channel_task,
+        create_task,
+        create_capability_run,
+        decide_approval,
+        get_channel,
+        get_channel_task,
+        get_task,
+        get_user,
+        list_capability_artifacts,
+        list_capability_runs,
+        update_capability_run,
+        unbind_channel_task,
+        upsert_channel,
+        upsert_user,
+    )
+    from agent.approval_scope_service import get_scope_task_context, list_scoped_approvals
+    from agent.task_panel_service import get_task_panel_snapshot
+    from agent.task_panels import build_activity_snapshot_text, format_approval_list_text, format_task_panel_snapshot
+    from agent.task_sync_commands import (
+        TASK_SYNC_BROADCAST_PREFIXES,
+        TASK_SYNC_LINK_COMMANDS,
+        build_channel_sync_payload,
+        parse_task_sync_control_text,
+    )
+    from scripts.business_task_ops import run_channel_command
+except Exception:  # pragma: no cover - business DB must not break the adapter import path.
+    append_job_event = None  # type: ignore[assignment]
+    dispatch_business_text_command = None  # type: ignore[assignment]
+    create_job = None  # type: ignore[assignment]
+    list_jobs = None  # type: ignore[assignment]
+    update_job = None  # type: ignore[assignment]
+    create_capability_run = None  # type: ignore[assignment]
+    decide_approval = None  # type: ignore[assignment]
+    get_channel = None  # type: ignore[assignment]
+    get_channel_task = None  # type: ignore[assignment]
+    get_task_panel_snapshot = None  # type: ignore[assignment]
+    get_task = None  # type: ignore[assignment]
+    get_user = None  # type: ignore[assignment]
+    get_scope_task_context = None  # type: ignore[assignment]
+    format_approval_list_text = None  # type: ignore[assignment]
+    build_activity_snapshot_text = None  # type: ignore[assignment]
+    format_task_panel_snapshot = None  # type: ignore[assignment]
+    list_capability_artifacts = None  # type: ignore[assignment]
+    list_scoped_approvals = None  # type: ignore[assignment]
+    list_capability_runs = None  # type: ignore[assignment]
+    update_capability_run = None  # type: ignore[assignment]
+    upsert_channel = None  # type: ignore[assignment]
+    upsert_user = None  # type: ignore[assignment]
+    TASK_SYNC_BROADCAST_PREFIXES = ("任务广播", "同步到任务频道", "同步播报", "发同步", "tasksync")
+    TASK_SYNC_LINK_COMMANDS = ("任务频道", "关联频道", "任务关联频道", "看同步", "task links")
+    build_channel_sync_payload = None  # type: ignore[assignment]
+    parse_task_sync_control_text = None  # type: ignore[assignment]
+    run_channel_command = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -186,9 +256,70 @@ _APPROVAL_LABEL_MAP: Dict[str, str] = {
     "always": "Approved permanently",
     "deny": "Denied",
 }
+FEISHU_OPENCLAW_OFFLOAD_ENABLED = os.getenv("FEISHU_OPENCLAW_OFFLOAD_ENABLED", "true").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES = {
+    item.strip().lower()
+    for item in os.getenv(
+        "FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES",
+        "bid_research,contract_retrieval,customer_followup,ops_recovery",
+    ).split(",")
+    if item.strip()
+}
+FEISHU_CAPABILITY_BRIDGE = FeishuCapabilityBridge(
+    FeishuCapabilityBridgeConfig(
+        offload_enabled=FEISHU_OPENCLAW_OFFLOAD_ENABLED,
+        offload_capabilities=frozenset(FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES),
+    )
+)
+_FEISHU_STOP_TEXT_COMMANDS = {
+    "停止",
+    "停止当前任务",
+    "取消当前任务",
+    "别查了",
+    "不要再找了",
+    "stop",
+    "cancel",
+    "abort",
+}
+_FEISHU_STATUS_TEXT_COMMANDS = {"状态", "status", "进度", "当前任务状态", "本任务状态", "当前任务汇总", "本任务汇总"}
+_FEISHU_APPROVAL_LIST_TEXT_COMMANDS = {"审批列表", "审批列表全部", "approval list", "approvals"}
+_FEISHU_CURRENT_TASK_COMMANDS = {"当前任务", "本群任务", "task", "current task"}
+_FEISHU_TASK_CREATE_PREFIXES = ("建任务", "创建任务", "新建任务", "新任务", "createtask")
+_FEISHU_TASK_BIND_PREFIXES = ("绑定任务", "关联任务", "挂任务", "bindtask")
+_FEISHU_TASK_UNBIND_COMMANDS = {"解绑任务", "取消绑定任务", "unbindtask"}
+_FEISHU_TASK_LINK_TEXT_COMMANDS = set(TASK_SYNC_LINK_COMMANDS)
+_FEISHU_TASK_BROADCAST_PREFIXES = TASK_SYNC_BROADCAST_PREFIXES
+_FEISHU_DINGTALK_RELAY_PREFIXES = (
+    "派给钉钉子智能体",
+    "交给钉钉子智能体",
+    "让钉钉子智能体去做",
+    "钉钉子智能体执行",
+    "派给钉钉",
+    "dingtalk send",
+)
+_FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS = {
+    "钉钉桥状态",
+    "钉桥状态",
+    "桥状态",
+    "钉钉桥身份",
+    "钉桥身份",
+    "桥身份",
+    "dingtalk bridge status",
+    "dingtalk bridge whoami",
+}
+_BID_RESEARCH_PATTERNS = (r"投标", r"招标", r"中标", r"采购公告", r"采购需求", r"招采", r"标书")
+_CONTRACT_RETRIEVAL_PATTERNS = (r"中标合同", r"采购合同", r"合同附件", r"合同原件", r"合同扫描件", r"合同")
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
+_DEFAULT_DINGTALK_RELAY_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/dingtalk_relay.py")
+_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/control-plane.ps1")
+_DEFAULT_WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # QR onboarding constants
 _ONBOARD_ACCOUNTS_URLS = {
@@ -218,6 +349,220 @@ FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
 
 _PREFERRED_LOCALES = ("zh_cn", "en_us")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
+
+
+def _normalize_control_text(text: str) -> str:
+    return re.sub(r"\s+", "", str(text or "").strip()).lower()
+
+
+_FEISHU_STOP_TEXT_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_STOP_TEXT_COMMANDS)
+_FEISHU_STATUS_TEXT_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_STATUS_TEXT_COMMANDS)
+_FEISHU_STATUS_ACTIVE_ONLY_COMMANDS_NORM = frozenset(
+    _normalize_control_text(item) for item in ("状态", "status", "进度")
+)
+_FEISHU_APPROVAL_LIST_TEXT_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_APPROVAL_LIST_TEXT_COMMANDS)
+_FEISHU_CURRENT_TASK_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_CURRENT_TASK_COMMANDS)
+_FEISHU_TASK_UNBIND_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_TASK_UNBIND_COMMANDS)
+_FEISHU_TASK_LINK_TEXT_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_TASK_LINK_TEXT_COMMANDS)
+_FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS_NORM = frozenset(_normalize_control_text(item) for item in _FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS)
+
+
+def _extract_dingtalk_relay_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    for prefix in _FEISHU_DINGTALK_RELAY_PREFIXES:
+        if lowered.startswith(prefix.lower()):
+            return raw[len(prefix):].strip(" ：:")
+    return ""
+
+
+def _extract_prefixed_text(text: str, prefixes: tuple[str, ...]) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    lowered = raw.lower()
+    for prefix in prefixes:
+        if lowered.startswith(prefix.lower()):
+            return raw[len(prefix):].strip(" ：:")
+    return ""
+
+
+def _is_dingtalk_bridge_status_text(text: str) -> bool:
+    normalized = _normalize_control_text(text)
+    if normalized in _FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS_NORM:
+        return True
+    return bool(
+        ("桥" in normalized or "bridge" in normalized)
+        and ("状态" in normalized or "身份" in normalized or "status" in normalized or "whoami" in normalized)
+        and ("钉" in normalized or "dingtalk" in normalized)
+    )
+
+
+def _looks_like_dingtalk_test_text(text: str) -> bool:
+    normalized = str(text or "").strip().lower()
+    if not normalized:
+        return False
+    return any(token in normalized for token in ("测试", "test", "ping", "桥状态", "桥身份"))
+
+
+def _mask_identifier(value: str, keep: int = 6) -> str:
+    token = str(value or "").strip()
+    if not token:
+        return "-"
+    if len(token) <= keep:
+        return token
+    return f"...{token[-keep:]}"
+
+
+def _is_feishu_control_text(text: str) -> bool:
+    normalized = _normalize_control_text(text)
+    if not normalized:
+        return False
+    if (
+        normalized in _FEISHU_STATUS_TEXT_COMMANDS_NORM
+        or normalized in _FEISHU_APPROVAL_LIST_TEXT_COMMANDS_NORM
+        or normalized in _FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS_NORM
+        or normalized in _FEISHU_STOP_TEXT_COMMANDS_NORM
+        or normalized in _FEISHU_CURRENT_TASK_COMMANDS_NORM
+        or normalized in _FEISHU_TASK_LINK_TEXT_COMMANDS_NORM
+        or normalized in _FEISHU_TASK_UNBIND_COMMANDS_NORM
+    ):
+        return True
+    if _extract_prefixed_text(text, _FEISHU_TASK_CREATE_PREFIXES):
+        return True
+    if _extract_prefixed_text(text, _FEISHU_TASK_BIND_PREFIXES):
+        return True
+    if parse_task_sync_control_text is not None and parse_task_sync_control_text(
+        text,
+        normalize=_normalize_control_text,
+        extract_prefixed_text=_extract_prefixed_text,
+        link_commands=tuple(_FEISHU_TASK_LINK_TEXT_COMMANDS),
+        broadcast_prefixes=_FEISHU_TASK_BROADCAST_PREFIXES,
+    ):
+        return True
+    if _extract_dingtalk_relay_text(text):
+        return True
+    if normalized.startswith("批准approval-") or normalized.startswith("拒绝approval-"):
+        return True
+    return False
+
+
+def _is_contract_retrieval_question(question: str) -> bool:
+    normalized = str(question or "").strip()
+    if not normalized:
+        return False
+    has_contract = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _CONTRACT_RETRIEVAL_PATTERNS)
+    has_context = any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _BID_RESEARCH_PATTERNS) or bool(
+        re.search(r"(司羿|项目|采购|成交|中选|\d{2,4}\s*年|\d{1,2}\s*[/-]\s*\d{1,2})", normalized, flags=re.IGNORECASE)
+    )
+    return has_contract and has_context
+
+
+def _is_bid_research_question(question: str) -> bool:
+    normalized = str(question or "").strip()
+    if not normalized:
+        return False
+    return any(re.search(pattern, normalized, flags=re.IGNORECASE) for pattern in _BID_RESEARCH_PATTERNS)
+
+
+def _detect_capability_route(question: str) -> Optional[Dict[str, str]]:
+    return detect_capability_route(question)
+    normalized = str(question or "").strip()
+    if not normalized:
+        return None
+    compact = re.sub(r"\s+", "", normalized)
+    if _is_contract_retrieval_question(normalized):
+        return {
+            "capability": "contract_retrieval",
+            "mode": "guided",
+            "title": f"Contract retrieval - {normalized[:64]}",
+        }
+    if _is_bid_research_question(normalized):
+        return {
+            "capability": "bid_research",
+            "mode": "guided",
+            "title": f"Bid research - {normalized[:64]}",
+        }
+    if re.search(r"(会议纪要|会议记录|整理会议|纪要整理|会议总结)", compact, re.IGNORECASE):
+        return {
+            "capability": "meeting_minutes",
+            "mode": "guided",
+            "title": f"Meeting minutes - {normalized[:64]}",
+        }
+    if re.search(r"(日报|周报|月报|进展汇总|工作汇总|任务汇总)", compact, re.IGNORECASE):
+        return {
+            "capability": "report_rollup",
+            "mode": "guided",
+            "title": f"Report rollup - {normalized[:64]}",
+        }
+    return None
+
+
+def _route_prefers_openclaw(route: Optional[Dict[str, str]]) -> bool:
+    return FEISHU_CAPABILITY_BRIDGE.route_prefers_openclaw(route)
+    if not FEISHU_OPENCLAW_OFFLOAD_ENABLED or not route:
+        return False
+    return str(route.get("capability") or "").strip().lower() in FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES
+
+
+def _build_contract_retrieval_brief(question: str) -> str:
+    return (
+        "这是“具体合同/附件取证”任务，不是普通关键词搜索。\n"
+        "先自己判断最有希望的取证路径，再把下面步骤当检查清单；如果你发现更快、更可靠的证据链，可以调整顺序。\n"
+        "1. 先拆线索：年份、公司名、产品/方案名、项目简称、日期/批次号、采购主体。\n"
+        "2. 先搜可直接访问的内部来源：本机目录、共享盘、映射盘、知识库、历史导出文件。\n"
+        "3. 再搜公开来源，但要按证据链追：中标公告 -> 合同公告 -> 附件/归档 PDF。\n"
+        "4. 对同一项目做别名归并，避免同名项目混淆。\n"
+        "5. 输出时明确证据等级、链接/路径、判断依据、还缺什么才能拿到真正合同。\n"
+        "6. 不允许臆造合同内容；找不到就明确卡点。\n"
+        f"\n当前用户原始问题：{question}"
+    )
+
+
+def _build_bid_research_brief(question: str) -> str:
+    return (
+        "这是商务投标/招标检索任务，不要退化成只打一个关键词去搜索。\n"
+        "先自己理解任务，再把下面流程当脚手架：\n"
+        "1. 拆出产品/方案别名、采购主体、地区、时间窗、预算/场景。\n"
+        "2. 生成检索矩阵，而不是单一关键词。\n"
+        "3. 分层搜索来源：政府采购网、公共资源交易中心、医院/高校/机构采购页、历史中标。\n"
+        "4. 先判断业务匹配，再收录；不匹配的结果不要硬塞。\n"
+        "5. 结果要去重、打分、排序，并给出下一步建议。\n"
+        f"\n当前用户原始问题：{question}"
+    )
+
+
+def _build_capability_route_brief(route: Dict[str, str], question: str) -> str:
+    capability = str(route.get("capability") or "").strip()
+    mode = str(route.get("mode") or "guided").strip().lower()
+    common = (
+        f"自动识别业务能力：{capability}（{mode}）\n"
+        "先自己思考最有效的完成路径，再把 capability 当脚手架推进；不要退化成僵硬脚本。\n"
+        "输出中至少体现：目标、关键步骤、证据来源、结果、下一步。"
+    )
+    if capability == "bid_research":
+        return common + "\n优先按投标检索工作流执行，不要退化成单关键词搜索。"
+    if capability == "contract_retrieval":
+        return common + "\n优先按合同取证工作流执行，不要把中标公告误当合同原件。"
+    return common + f"\n当前用户原始问题：{question}"
+
+
+def _build_effective_question(question: str) -> str:
+    return FEISHU_CAPABILITY_BRIDGE.build_effective_question(question)
+    route = _detect_capability_route(question)
+    parts: List[str] = []
+    if route:
+        parts.append(_build_capability_route_brief(route, question))
+    if _is_contract_retrieval_question(question):
+        parts.append(_build_contract_retrieval_brief(question))
+    elif _is_bid_research_question(question):
+        parts.append(_build_bid_research_brief(question))
+    if not parts:
+        return question
+    parts.append(f"用户问题：{question}")
+    return "\n\n".join(parts)
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
 _WHITESPACE_RE = re.compile(r"\s+")
 _SUPPORTED_CARD_TEXT_KEYS = (
@@ -1096,6 +1441,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Exec approval button state (approval_id → {session_key, message_id, chat_id})
         self._approval_state: Dict[int, Dict[str, str]] = {}
         self._approval_counter = itertools.count(1)
+        self._status_service: Optional[FeishuStatusService] = None
+        self._control_router: Optional[FeishuControlRouter] = None
+        self._capability_route_service: Optional[CapabilityRouteService] = None
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2354,10 +2702,25 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_to_text=reply_to_text,
             timestamp=datetime.now(),
         )
+        await self._sync_business_identity(normalized)
         await self._dispatch_inbound_event(normalized)
 
     async def _dispatch_inbound_event(self, event: MessageEvent) -> None:
         """Apply Feishu-specific burst protection before entering the base adapter."""
+        if event.text:
+            try:
+                if await self._handle_background_control_text(event):
+                    return
+            except Exception as exc:
+                logger.exception("[Feishu] Background control command failed: %s", exc)
+                try:
+                    await self._send_plain(event, f"控制命令执行失败：{exc}")
+                except Exception:
+                    logger.exception("[Feishu] Failed to send control-command error reply")
+                return
+        if event.message_type == MessageType.TEXT:
+            if not event.is_command() and await self._maybe_handle_openclaw_route(event):
+                return
         if event.message_type == MessageType.TEXT and not event.is_command():
             await self._enqueue_text_event(event)
             return
@@ -3169,6 +3532,565 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("[Feishu] Background inbound processing failed")
 
+    def _session_key_for_event(self, event: MessageEvent) -> str:
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+
+    async def _sync_business_identity(self, event: MessageEvent) -> None:
+        if upsert_user is None or upsert_channel is None:
+            return
+        try:
+            user_id = str(event.source.user_id or "").strip()
+            user_id_alt = str(getattr(event.source, "user_id_alt", "") or "").strip()
+            existing_user = None
+            if get_user is not None and user_id:
+                existing_user = get_user(platform="feishu", user_id=user_id)
+            sender_ids = {user_id, user_id_alt} - {""}
+            role = str((existing_user or {}).get("role") or "").strip().lower()
+            if not role:
+                role = "owner" if sender_ids & self._admins else "user"
+            upsert_user(
+                platform="feishu",
+                user_id=user_id or user_id_alt,
+                display_name=str(event.source.user_name or "").strip(),
+                role=role or "user",
+            )
+            existing_channel = None
+            if get_channel is not None:
+                existing_channel = get_channel(
+                    platform="feishu",
+                    chat_id=str(event.source.chat_id or "").strip(),
+                    thread_id=str(event.source.thread_id or "").strip(),
+                )
+            upsert_channel(
+                platform="feishu",
+                chat_id=str(event.source.chat_id or "").strip(),
+                thread_id=str(event.source.thread_id or "").strip(),
+                task_id=str((existing_channel or {}).get("task_id") or "").strip(),
+                chat_name=str(event.source.chat_name or "").strip(),
+                chat_type=str(event.source.chat_type or "").strip(),
+                worker_role=str((existing_channel or {}).get("worker_role") or "").strip(),
+                allow_free_chat=bool((existing_channel or {}).get("allow_free_chat")) or str(event.source.chat_type or "").strip() == "dm",
+                policy=(existing_channel or {}).get("policy") or {},
+            )
+        except Exception:
+            logger.debug("[Feishu] Failed to sync business identity", exc_info=True)
+
+    def _is_owner_or_admin(self, event: MessageEvent) -> bool:
+        sender_ids = {
+            str(event.source.user_id or "").strip(),
+            str(getattr(event.source, "user_id_alt", "") or "").strip(),
+        } - {""}
+        return self._is_owner_or_admin_sender_ids(sender_ids)
+
+    def _is_owner_or_admin_sender_ids(self, sender_ids: set[str]) -> bool:
+        if sender_ids & self._admins:
+            return True
+        if get_user is None:
+            return False
+        for identifier in sender_ids:
+            try:
+                user = get_user(platform="feishu", user_id=identifier)
+            except Exception:
+                continue
+            if str((user or {}).get("role") or "").strip().lower() == "owner":
+                return True
+        return False
+
+    def _ensure_status_service(self) -> FeishuStatusService:
+        if self._status_service is None:
+            self._status_service = FeishuStatusService(
+                FeishuStatusServiceDeps(
+                    capability_bridge=FEISHU_CAPABILITY_BRIDGE,
+                    get_scope_task_context_func=get_scope_task_context,
+                    list_scoped_approvals_func=list_scoped_approvals,
+                    format_approval_list_text_func=format_approval_list_text,
+                    get_task_panel_snapshot_func=get_task_panel_snapshot,
+                    format_task_panel_snapshot_func=format_task_panel_snapshot,
+                    list_jobs_func=list_jobs,
+                    build_activity_snapshot_text_func=build_activity_snapshot_text,
+                )
+            )
+        return self._status_service
+
+    def _ensure_control_router(self) -> FeishuControlRouter:
+        if self._control_router is None:
+            self._control_router = FeishuControlRouter(
+                FeishuControlRouterDeps(
+                    send_plain=self._send_plain,
+                    is_owner_or_admin=self._is_owner_or_admin,
+                    get_dingtalk_bridge_status=self._get_dingtalk_bridge_status,
+                    relay_text_to_dingtalk=self._relay_text_to_dingtalk,
+                    cancel_background_job_for_session=self._cancel_background_job_for_session,
+                    build_adapter_context=build_adapter_context_for_event,
+                    normalize_text=_normalize_control_text,
+                    extract_prefixed_text=_extract_prefixed_text,
+                    is_dingtalk_bridge_status_text=_is_dingtalk_bridge_status_text,
+                    extract_dingtalk_relay_text=_extract_dingtalk_relay_text,
+                    looks_like_dingtalk_test_text=_looks_like_dingtalk_test_text,
+                    list_approval_rows_for_event=self._list_approval_rows_for_event,
+                    format_approval_list_text=self._format_approval_list_text,
+                    get_event_task_panel_snapshot=self._get_event_task_panel_snapshot,
+                    format_task_panel_snapshot=self._format_task_panel_snapshot,
+                    get_background_job_snapshot=self._get_background_job_snapshot,
+                    get_capability_run_snapshot=self._get_capability_run_snapshot,
+                    format_activity_snapshot=self._format_activity_snapshot,
+                    dispatch_business_text_command_func=dispatch_business_text_command,
+                    create_task_func=create_task,
+                    bind_channel_task_func=bind_channel_task,
+                    get_channel_task_func=get_channel_task,
+                    get_task_func=get_task,
+                    unbind_channel_task_func=unbind_channel_task,
+                    decide_approval_func=decide_approval,
+                    parse_task_sync_control_text_func=parse_task_sync_control_text,
+                    build_channel_sync_payload_func=build_channel_sync_payload,
+                    run_channel_command_func=run_channel_command,
+                    task_create_prefixes=_FEISHU_TASK_CREATE_PREFIXES,
+                    current_task_commands_norm=_FEISHU_CURRENT_TASK_COMMANDS_NORM,
+                    task_bind_prefixes=_FEISHU_TASK_BIND_PREFIXES,
+                    task_unbind_commands_norm=_FEISHU_TASK_UNBIND_COMMANDS_NORM,
+                    task_link_text_commands=tuple(_FEISHU_TASK_LINK_TEXT_COMMANDS),
+                    task_broadcast_prefixes=tuple(_FEISHU_TASK_BROADCAST_PREFIXES),
+                    status_text_commands_norm=_FEISHU_STATUS_TEXT_COMMANDS_NORM,
+                    status_active_only_commands_norm=_FEISHU_STATUS_ACTIVE_ONLY_COMMANDS_NORM,
+                    stop_text_commands_norm=_FEISHU_STOP_TEXT_COMMANDS_NORM,
+                    approval_list_commands_norm=_FEISHU_APPROVAL_LIST_TEXT_COMMANDS_NORM,
+                )
+            )
+        return self._control_router
+
+    def _ensure_capability_route_service(self) -> CapabilityRouteService:
+        if self._capability_route_service is None:
+            self._capability_route_service = CapabilityRouteService(
+                CapabilityRouteServiceDeps(
+                    detect_capability_route=_detect_capability_route,
+                    route_prefers_openclaw=_route_prefers_openclaw,
+                    create_capability_run=self._create_capability_run_for_route,
+                    create_background_job=self._create_background_job_for_route,
+                )
+            )
+        return self._capability_route_service
+
+    def _get_event_task_context(self, event: MessageEvent) -> tuple[str, str]:
+        return self._ensure_status_service().get_event_task_context(event)
+
+    def _list_approval_rows_for_event(
+        self,
+        event: MessageEvent,
+        *,
+        scope_all: bool,
+        status: str,
+        limit: int = 10,
+    ) -> tuple[list[Dict[str, Any]], str, str]:
+        return self._ensure_status_service().list_approval_rows_for_event(
+            event,
+            scope_all=scope_all,
+            status=status,
+            limit=limit,
+        )
+
+    def _format_approval_list_text(self, rows: List[Dict[str, Any]], event: MessageEvent, *, scope_all: bool) -> str:
+        return self._ensure_status_service().format_approval_list_text(rows, event, scope_all=scope_all)
+
+    async def _send_approval_list_for_event(self, event: MessageEvent, normalized: str) -> bool:
+        return await self._ensure_control_router().send_approval_list_for_event(event, normalized)
+
+    async def _decide_approval_from_event_text(self, event: MessageEvent, *, decision: str) -> bool:
+        return await self._ensure_control_router().decide_approval_from_event_text(event, decision=decision)
+
+    async def _handle_task_control_text(self, event: MessageEvent, normalized: str, session_key: str) -> bool:
+        return await self._ensure_control_router().handle_task_control_text(
+            event,
+            normalized=normalized,
+            session_key=session_key,
+        )
+
+    async def _handle_status_control_text(self, event: MessageEvent, normalized: str, session_key: str) -> bool:
+        return await self._ensure_control_router().handle_status_control_text(
+            event,
+            normalized=normalized,
+            session_key=session_key,
+        )
+
+    async def _handle_dingtalk_bridge_control_text(self, event: MessageEvent) -> bool:
+        return await self._ensure_control_router().handle_dingtalk_bridge_control_text(event)
+
+    def _get_event_task_panel_snapshot(self, event: MessageEvent, *, active_only: bool = False) -> Optional[Dict[str, Any]]:
+        return self._ensure_status_service().get_event_task_panel_snapshot(event, active_only=active_only)
+
+    def _format_task_panel_snapshot(self, snapshot: Dict[str, Any]) -> str:
+        return self._ensure_status_service().format_task_panel_snapshot(snapshot)
+
+    def _get_background_job_snapshot(
+        self,
+        session_key: str,
+        *,
+        event: Optional[MessageEvent] = None,
+        active_only: bool = True,
+        global_fallback: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        return self._ensure_status_service().get_background_job_snapshot(
+            session_key,
+            event=event,
+            active_only=active_only,
+            global_fallback=global_fallback,
+        )
+
+    def _get_capability_run_snapshot(
+        self,
+        session_key: str,
+        *,
+        event: Optional[MessageEvent] = None,
+        active_only: bool = True,
+        global_fallback: bool = False,
+    ) -> Optional[Dict[str, Any]]:
+        return self._ensure_status_service().get_capability_run_snapshot(
+            session_key,
+            event=event,
+            active_only=active_only,
+            global_fallback=global_fallback,
+        )
+
+    def _format_activity_snapshot(
+        self,
+        *,
+        job: Optional[Dict[str, Any]] = None,
+        run: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        return self._ensure_status_service().format_activity_snapshot(job=job, run=run)
+
+    def _cancel_background_job_for_session(
+        self,
+        session_key: str,
+        *,
+        event: Optional[MessageEvent] = None,
+        global_fallback: bool = False,
+    ) -> Dict[str, Any]:
+        source = event.source if event is not None else None
+        return FEISHU_CAPABILITY_BRIDGE.cancel_background_job_for_session(
+            session_key,
+            list_jobs_func=list_jobs,
+            update_job_func=update_job,
+            append_job_event_func=append_job_event,
+            update_capability_run_func=update_capability_run,
+            global_fallback=global_fallback,
+            platform="feishu",
+            chat_id=str(getattr(source, "chat_id", "") or ""),
+            thread_id=str(getattr(source, "thread_id", "") or ""),
+        )
+        if list_jobs is None or update_job is None:
+            return {"ok": False, "cancelled": 0}
+        rows = list_jobs(limit=50, active_only=True)
+        cancelled = 0
+        run_ids: List[str] = []
+        cancelled_job_ids: set[str] = set()
+        for row in rows:
+            tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
+            if str(row.get("session_id") or "").strip() != session_key:
+                continue
+            if "executor:openclaw" not in tags:
+                continue
+            runner_pid = row.get("runner_pid")
+            if runner_pid:
+                try:
+                    os.killpg(int(runner_pid), signal.SIGTERM)
+                except Exception:
+                    try:
+                        os.kill(int(runner_pid), signal.SIGTERM)
+                    except Exception:
+                        pass
+            update_job(
+                str(row.get("job_id") or "").strip(),
+                status="cancelled",
+                blocker="Cancelled from Feishu control command.",
+                result="Background research task cancelled from Feishu.",
+                runner_pid=None,
+                runner_runtime="",
+            )
+            if append_job_event is not None:
+                append_job_event(
+                    str(row.get("job_id") or "").strip(),
+                    kind="cancelled",
+                    status="cancelled",
+                    message="Cancelled from Feishu control command.",
+                    blocker="Cancelled from Feishu control command.",
+                )
+            cancelled += 1
+            cancelled_job_ids.add(str(row.get("job_id") or "").strip())
+            for tag in tags:
+                if tag.startswith("capability_run:") and tag.split(":", 1)[1]:
+                    run_ids.append(tag.split(":", 1)[1])
+        if list_capability_runs is not None and update_capability_run is not None:
+            try:
+                for run in list_capability_runs(status="", limit=100):
+                    if str(run.get("background_job_id") or "").strip() in cancelled_job_ids:
+                        run_ids.append(str(run.get("run_id") or "").strip())
+            except Exception:
+                pass
+            for run_id in {item for item in run_ids if item}:
+                try:
+                    update_capability_run(
+                        run_id,
+                        status="cancelled",
+                        blocker="Cancelled from Feishu control command.",
+                        result="Capability run cancelled before completion.",
+                    )
+                except Exception:
+                    logger.debug("[Feishu] Failed to cancel capability run %s", run_id, exc_info=True)
+        return {"ok": True, "cancelled": cancelled}
+
+    async def _send_plain(self, event: MessageEvent, content: str) -> bool:
+        result = await self.send(
+            event.source.chat_id,
+            content,
+            reply_to=event.message_id,
+            metadata={"session_key": self._session_key_for_event(event)},
+        )
+        return bool(result.success)
+
+    async def _relay_text_to_dingtalk(self, text: str) -> Dict[str, Any]:
+        relay_script = Path(os.getenv("DINGTALK_RELAY_SCRIPT", str(_DEFAULT_DINGTALK_RELAY_SCRIPT)))
+        if not relay_script.exists():
+            return {"ok": False, "error": f"DingTalk relay script not found: {relay_script}"}
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["python3", str(relay_script), "--message", text],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        completed = await asyncio.to_thread(_run)
+        output = (completed.stdout or completed.stderr or "").strip()
+        if not output:
+            return {"ok": False, "error": "DingTalk relay returned empty output."}
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return {"ok": completed.returncode == 0, "raw": output, "error": output if completed.returncode else ""}
+        if completed.returncode != 0:
+            payload.setdefault("ok", False)
+        return payload
+
+    async def _get_dingtalk_bridge_status(self) -> str:
+        control_plane_script = Path(os.getenv("HERMES_DINGTALK_CONTROL_PLANE_SCRIPT", str(_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT)))
+        lines: List[str] = ["钉钉桥状态"]
+        if not control_plane_script.exists():
+            return f"钉钉桥状态查询失败：control-plane 不存在：{control_plane_script}"
+        powershell_bin = os.getenv("WINDOWS_POWERSHELL_BIN", _DEFAULT_WINDOWS_POWERSHELL).strip() or _DEFAULT_WINDOWS_POWERSHELL
+
+        def _to_windows_path(path: Path) -> str:
+            raw = str(path)
+            if raw.startswith("/mnt/") and len(raw) > 6 and raw[5].isalpha() and raw[6] == "/":
+                drive = raw[5].upper()
+                rest = raw[7:].replace("/", "\\")
+                return f"{drive}:\\{rest}"
+            return raw
+
+        control_plane_windows_path = _to_windows_path(control_plane_script)
+
+        def _decode_output(raw: bytes) -> str:
+            if not raw:
+                return ""
+            for encoding in ("utf-8", "gb18030", "cp936"):
+                try:
+                    return raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", errors="replace")
+
+        def _run_status() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    powershell_bin,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    control_plane_windows_path,
+                    "status",
+                ],
+                capture_output=True,
+                text=False,
+                timeout=30,
+                check=False,
+            )
+
+        completed = await asyncio.to_thread(_run_status)
+        payload: Dict[str, Any] = {}
+        output = _decode_output(completed.stdout or completed.stderr or b"").strip()
+        if output:
+            try:
+                payload = json.loads(output)
+            except json.JSONDecodeError:
+                payload = {}
+
+        if completed.returncode == 0 and payload:
+            message = str(payload.get("message") or "").strip()
+            details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+            dingtalk = details.get("dingtalk") if isinstance(details.get("dingtalk"), dict) else {}
+            health = dingtalk.get("health") if isinstance(dingtalk.get("health"), dict) else {}
+            if message:
+                lines.append(f"- 服务摘要: {message}")
+            lines.append(f"- 服务模式: {str(dingtalk.get('mode') or '-').strip() or '-'}")
+            lines.append(f"- 服务状态: {str(dingtalk.get('service_state') or '-').strip() or '-'}")
+            lines.append(f"- 健康状态: {str(health.get('status') or '-').strip() or '-'}")
+            pid = str(health.get("pid") or "").strip()
+            if pid:
+                lines.append(f"- 进程 PID: {pid}")
+        else:
+            lines.append(f"- 服务状态查询失败: {output or f'exit {completed.returncode}'}")
+
+        env_path = control_plane_script.parent / ".env"
+        env_values: Dict[str, str] = {}
+        try:
+            if env_path.exists():
+                for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+                    line = raw_line.strip()
+                    if not line or line.startswith("#") or "=" not in line:
+                        continue
+                    key, value = line.split("=", 1)
+                    env_values[key.strip()] = value.strip().strip("'\"")
+        except Exception:
+            env_values = {}
+
+        client_id = env_values.get("DINGTALK_CLIENT_ID", "")
+        primary_chat_id = env_values.get("DINGTALK_PRIMARY_CHAT_ID", "")
+        primary_user_ids = [item.strip() for item in env_values.get("DINGTALK_PRIMARY_USER_IDS", "").split(",") if item.strip()]
+        lines.append(f"- stream/bridge Client ID 后缀: {_mask_identifier(client_id)}")
+        lines.append(f"- PRIMARY_CHAT_ID 后缀: {_mask_identifier(primary_chat_id)}")
+        lines.append(f"- PRIMARY_USER_IDS 后缀: {', '.join(_mask_identifier(item) for item in primary_user_ids) or '-'}")
+        relay_script = Path(os.getenv("DINGTALK_RELAY_SCRIPT", str(_DEFAULT_DINGTALK_RELAY_SCRIPT)))
+        if relay_script.exists():
+            def _run_relay_dry_run() -> subprocess.CompletedProcess[str]:
+                clean_env = {
+                    key: value
+                    for key, value in os.environ.items()
+                    if not key.startswith("DINGTALK_")
+                }
+                return subprocess.run(
+                    ["python3", str(relay_script), "--message", "bridge-probe", "--dry-run"],
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                    env=clean_env,
+                    check=False,
+                )
+
+            relay_completed = await asyncio.to_thread(_run_relay_dry_run)
+            relay_output = (relay_completed.stdout or relay_completed.stderr or "").strip()
+            relay_payload: Dict[str, Any] = {}
+            if relay_output:
+                try:
+                    relay_payload = json.loads(relay_output)
+                except json.JSONDecodeError:
+                    relay_payload = {}
+            if relay_completed.returncode == 0 and relay_payload:
+                lines.append("- 互通 dry-run: 成功")
+                relay_client_suffix = str(relay_payload.get("client_id_suffix") or relay_payload.get("robot_code_suffix") or "").strip()
+                if relay_client_suffix:
+                    lines.append(f"- relay Client ID 后缀: {_mask_identifier(relay_client_suffix, keep=6)}")
+                lines.append(f"- relay chat_id 后缀: {_mask_identifier(str(relay_payload.get('chat_id') or '').strip())}")
+                relay_user_ids = relay_payload.get("user_ids") if isinstance(relay_payload.get("user_ids"), list) else []
+                lines.append(f"- relay user_ids 后缀: {', '.join(_mask_identifier(str(item).strip()) for item in relay_user_ids if str(item).strip()) or '-'}")
+                lines.append(
+                    f"- relay 是否命中 PRIMARY_CHAT_ID: {'是' if str(relay_payload.get('chat_id') or '').strip() == primary_chat_id and primary_chat_id else '否'}"
+                )
+                if relay_client_suffix:
+                    expected_suffix = client_id[-6:] if len(client_id) > 6 else client_id
+                    lines.append(f"- relay 是否命中当前 bridge client: {'是' if relay_client_suffix == expected_suffix else '否'}")
+            else:
+                lines.append(f"- 互通 dry-run: 失败 ({relay_output or f'exit {relay_completed.returncode}'})")
+        else:
+            lines.append(f"- 互通 dry-run: relay 脚本不存在：{relay_script}")
+        lines.append("")
+        lines.append("说明:")
+        lines.append("- 这里已包含一次后端互通 dry-run，不会主动往钉钉发测试消息。")
+        lines.append("- 给钉钉子智能体派任务请用：派给钉钉子智能体 <任务>。底层不是当前钉钉会话回复壳。")
+        return "\n".join(lines)
+
+    async def _handle_background_control_text(self, event: MessageEvent) -> bool:
+        normalized = _normalize_control_text(event.text)
+        session_key = self._session_key_for_event(event)
+        return await self._ensure_control_router().handle_background_control_text(
+            event,
+            normalized=normalized,
+            session_key=session_key,
+        )
+
+    def _create_capability_run_for_route(self, event: MessageEvent, route: Dict[str, str]) -> Optional[Dict[str, Any]]:
+        return FEISHU_CAPABILITY_BRIDGE.create_capability_run_for_route(
+            event,
+            route,
+            session_key_builder=self._session_key_for_event,
+            create_capability_run_func=create_capability_run,
+        )
+
+    def _create_background_job_for_route(
+        self,
+        event: MessageEvent,
+        route: Dict[str, str],
+        run_record: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Dict[str, Any]]:
+        return FEISHU_CAPABILITY_BRIDGE.create_background_job_for_route(
+            event,
+            route,
+            run_record=run_record,
+            session_key_builder=self._session_key_for_event,
+            create_job_func=create_job,
+            update_capability_run_func=update_capability_run,
+        )
+        record = create_job(
+            title=str(route.get("title") or (event.text or "")[:80]).strip(),
+            prompt=prompt,
+            origin=origin,
+            session_id=session_key,
+            user_id=str(event.source.user_id or getattr(event.source, "user_id_alt", "") or "").strip(),
+            priority="normal",
+            tags=[
+                "executor:openclaw",
+                "source:feishu",
+                f"capability:{capability}",
+                f"route_mode:{str(route.get('mode') or 'guided').strip().lower()}",
+            ]
+            + (
+                [f"capability_run:{str((run_record or {}).get('run_id') or '').strip()}"]
+                if str((run_record or {}).get("run_id") or "").strip()
+                else []
+            ),
+        )
+        run_id = str((run_record or {}).get("run_id") or "").strip()
+        if run_id and update_capability_run is not None:
+            try:
+                update_capability_run(
+                    run_id,
+                    background_job_id=str(record.get("job_id") or "").strip(),
+                    current_focus="Queued for OpenClaw research worker.",
+                    next_step="Background worker will dispatch this run to OpenClaw and auto-deliver the result back to Feishu.",
+                    output={
+                        "offloaded_to": "openclaw",
+                        "background_job_id": str(record.get("job_id") or "").strip(),
+                        "route_mode": str(route.get("mode") or "guided").strip().lower(),
+                    },
+                )
+            except Exception:
+                logger.debug("[Feishu] Failed to attach background job to capability run", exc_info=True)
+        return record
+
+    async def _maybe_handle_openclaw_route(self, event: MessageEvent) -> bool:
+        outcome = self._ensure_capability_route_service().maybe_offload_openclaw(event)
+        if not outcome.handled():
+            return False
+        await self._send_plain(event, outcome.user_reply)
+        return True
+
     # =========================================================================
     # Group policy and mention gating
     # =========================================================================
@@ -3209,17 +4131,26 @@ class FeishuAdapter(BasePlatformAdapter):
         """Require an explicit @mention before group messages enter the agent."""
         if not self._allow_group_message(sender_id, chat_id):
             return False
-        # @_all is Feishu's @everyone placeholder — always route to the bot.
+        sender_open_id = getattr(sender_id, "open_id", None)
+        sender_user_id = getattr(sender_id, "user_id", None)
+        sender_ids = {
+            str(sender_open_id or "").strip(),
+            str(sender_user_id or "").strip(),
+        } - {""}
         raw_content = getattr(message, "content", "") or ""
+        normalized = normalize_feishu_message(
+            message_type=getattr(message, "message_type", "") or "",
+            raw_content=raw_content,
+        )
+        control_text = normalized.text_content or raw_content
+        if sender_ids and self._is_owner_or_admin_sender_ids(sender_ids) and _is_feishu_control_text(control_text):
+            return True
+        # @_all is Feishu's @everyone placeholder — always route to the bot.
         if "@_all" in raw_content:
             return True
         mentions = getattr(message, "mentions", None) or []
         if mentions:
             return self._message_mentions_bot(mentions)
-        normalized = normalize_feishu_message(
-            message_type=getattr(message, "message_type", "") or "",
-            raw_content=raw_content,
-        )
         if normalized.mentioned_ids:
             return self._post_mentions_bot(normalized.mentioned_ids)
         return False

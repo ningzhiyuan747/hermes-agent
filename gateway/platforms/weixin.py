@@ -113,11 +113,47 @@ _HEADER_RE = re.compile(r"^(#{1,6})\s+(.+?)\s*$")
 _TABLE_RULE_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
 _FENCE_RE = re.compile(r"^```([^\n`]*)\s*$")
 _MARKDOWN_LINK_RE = re.compile(r"\[([^\]]+)\]\(([^)]+)\)")
+_WEIXIN_COMMAND_SEPARATORS_RE = re.compile(r"[\s\u3000`~!@#$%^&*()+=|\\/:;\"'“”‘’,，。！？?、<>《》【】\[\]\-]+")
+
+_WEIXIN_DIRECT_COMMAND_ALIASES = {
+    "停止": "/stop",
+    "停下": "/stop",
+    "停一下": "/stop",
+    "停一下先": "/stop",
+    "先停一下": "/stop",
+    "停止当前任务": "/stop",
+    "取消当前任务": "/stop",
+    "stop": "/stop",
+    "状态": "/status",
+    "进度": "/status",
+    "status": "/status",
+}
 
 
 def check_weixin_requirements() -> bool:
     """Return True when runtime dependencies for Weixin are available."""
     return AIOHTTP_AVAILABLE and CRYPTO_AVAILABLE
+
+
+def normalize_weixin_gateway_command_text(text: Optional[str]) -> str:
+    """Map short Chinese control commands to gateway slash commands.
+
+    WeChat users naturally type ``停止`` instead of ``/stop``.  Normalize a
+    tight set of direct imperative control phrases so the generic gateway
+    command dispatcher can interrupt active sessions.
+    """
+    raw = str(text or "").strip()
+    if not raw or raw.startswith("/"):
+        return raw
+
+    compact = _WEIXIN_COMMAND_SEPARATORS_RE.sub("", raw).lower()
+    if not compact:
+        return raw
+
+    alias = _WEIXIN_DIRECT_COMMAND_ALIASES.get(compact)
+    if alias:
+        return alias
+    return raw
 
 
 def _safe_id(value: Optional[str], keep: int = 8) -> str:
@@ -1094,6 +1130,11 @@ class WeixinAdapter(BasePlatformAdapter):
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
+        self._debug_inbound = _coerce_bool(
+            extra.get("debug_inbound")
+            or os.getenv("WEIXIN_DEBUG_INBOUND"),
+            default=False,
+        )
 
         if self._account_id and not self._token:
             persisted = load_weixin_account(hermes_home, self._account_id)
@@ -1110,6 +1151,32 @@ class WeixinAdapter(BasePlatformAdapter):
         if isinstance(value, (list, tuple, set)):
             return [str(item).strip() for item in value if str(item).strip()]
         return [str(value).strip()] if str(value).strip() else []
+
+    def _debug_log(self, template: str, *args: Any) -> None:
+        if not self._debug_inbound:
+            return
+        logger.info("[%s][debug] " + template, self.name, *args)
+
+    def _debug_message_brief(self, message: Dict[str, Any]) -> str:
+        item_list = message.get("item_list") or []
+        item_types = []
+        for item in item_list[:6]:
+            try:
+                item_types.append(str(item.get("type")))
+            except Exception:
+                item_types.append("?")
+        return (
+            "message_id={message_id} from={from_user_id} to={to_user_id} room={room_id} "
+            "msg_type={msg_type} items={items} item_types={item_types}"
+        ).format(
+            message_id=_safe_id(str(message.get("message_id") or ""), keep=18),
+            from_user_id=_safe_id(str(message.get("from_user_id") or ""), keep=18),
+            to_user_id=_safe_id(str(message.get("to_user_id") or ""), keep=18),
+            room_id=_safe_id(str(message.get("room_id") or message.get("chat_room_id") or ""), keep=18),
+            msg_type=str(message.get("msg_type") or ""),
+            items=len(item_list),
+            item_types=",".join(item_types) if item_types else "-",
+        )
 
     async def connect(self) -> bool:
         if not check_weixin_requirements():
@@ -1205,7 +1272,10 @@ class WeixinAdapter(BasePlatformAdapter):
                     sync_buf = new_sync_buf
                     _save_sync_buf(self._hermes_home, self._account_id, sync_buf)
 
-                for message in response.get("msgs") or []:
+                messages = response.get("msgs") or []
+                if messages:
+                    self._debug_log("poll returned %d message(s)", len(messages))
+                for message in messages:
                     asyncio.create_task(self._process_message_safe(message))
             except asyncio.CancelledError:
                 break
@@ -1218,6 +1288,7 @@ class WeixinAdapter(BasePlatformAdapter):
 
     async def _process_message_safe(self, message: Dict[str, Any]) -> None:
         try:
+            self._debug_log("raw inbound %s", self._debug_message_brief(message))
             await self._process_message(message)
         except Exception as exc:
             logger.error("[%s] unhandled inbound error from=%s: %s", self.name, _safe_id(message.get("from_user_id")), exc, exc_info=True)
@@ -1226,21 +1297,27 @@ class WeixinAdapter(BasePlatformAdapter):
         assert self._session is not None
         sender_id = str(message.get("from_user_id") or "").strip()
         if not sender_id:
+            self._debug_log("drop inbound without sender_id")
             return
         if sender_id == self._account_id:
+            self._debug_log("drop self-message from account_id=%s", _safe_id(self._account_id, keep=18))
             return
 
         message_id = str(message.get("message_id") or "").strip()
         if message_id and self._dedup.is_duplicate(message_id):
+            self._debug_log("drop duplicate message_id=%s", _safe_id(message_id, keep=18))
             return
 
         chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
         if chat_type == "group":
             if self._group_policy == "disabled":
+                self._debug_log("drop group message because group policy is disabled chat=%s", _safe_id(effective_chat_id, keep=18))
                 return
             if self._group_policy == "allowlist" and effective_chat_id not in self._group_allow_from:
+                self._debug_log("drop group message not in allowlist chat=%s", _safe_id(effective_chat_id, keep=18))
                 return
         elif not self._is_dm_allowed(sender_id):
+            self._debug_log("drop dm from sender=%s due to dm policy=%s", _safe_id(sender_id, keep=18), self._dm_policy)
             return
 
         context_token = str(message.get("context_token") or "").strip()
@@ -1249,7 +1326,7 @@ class WeixinAdapter(BasePlatformAdapter):
         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
 
         item_list = message.get("item_list") or []
-        text = _extract_text(item_list)
+        text = normalize_weixin_gateway_command_text(_extract_text(item_list))
         media_paths: List[str] = []
         media_types: List[str] = []
 
@@ -1261,6 +1338,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 await self._collect_media(ref_item, media_paths, media_types)
 
         if not text and not media_paths:
+            self._debug_log("drop inbound without text/media from sender=%s", _safe_id(sender_id, keep=18))
             return
 
         source = self.build_source(
@@ -1280,6 +1358,14 @@ class WeixinAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+        self._debug_log(
+            "accept inbound sender=%s chat=%s chat_type=%s text_len=%d media=%d",
+            _safe_id(sender_id, keep=18),
+            _safe_id(effective_chat_id, keep=18),
+            chat_type,
+            len(text or ""),
+            len(media_paths),
+        )
         await self.handle_message(event)
 
     def _is_dm_allowed(self, sender_id: str) -> bool:

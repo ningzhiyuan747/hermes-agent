@@ -76,6 +76,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.session_memory_scope import build_session_memory_scope_prompt
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -3429,19 +3430,28 @@ class AIAgent:
         if system_message is not None:
             prompt_parts.append(system_message)
 
+        def _should_include_global_builtin_memory() -> bool:
+            try:
+                from gateway.session_context import get_session_env
+
+                return not bool(str(get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip())
+            except Exception:
+                return True
+
+        _include_global_builtin_memory = _should_include_global_builtin_memory()
+
         if self._memory_store:
-            if self._memory_enabled:
+            if self._memory_enabled and _include_global_builtin_memory:
                 mem_block = self._memory_store.format_for_system_prompt("memory")
                 if mem_block:
                     prompt_parts.append(mem_block)
-            # USER.md is always included when enabled.
-            if self._user_profile_enabled:
+            if self._user_profile_enabled and _include_global_builtin_memory:
                 user_block = self._memory_store.format_for_system_prompt("user")
                 if user_block:
                     prompt_parts.append(user_block)
 
         # External memory provider system prompt block (additive to built-in)
-        if self._memory_manager:
+        if self._memory_manager and _include_global_builtin_memory:
             try:
                 _ext_mem_block = self._memory_manager.build_system_prompt()
                 if _ext_mem_block:
@@ -3512,6 +3522,15 @@ class AIAgent:
             prompt_parts.append(PLATFORM_HINTS[platform_key])
 
         return "\n\n".join(p.strip() for p in prompt_parts if p.strip())
+
+    def _runtime_system_addendum(self) -> str:
+        parts: list[str] = []
+        runtime_scope_prompt = build_session_memory_scope_prompt()
+        if runtime_scope_prompt:
+            parts.append(runtime_scope_prompt)
+        if self.ephemeral_system_prompt:
+            parts.append(self.ephemeral_system_prompt)
+        return "\n\n".join(part.strip() for part in parts if str(part or "").strip())
 
     # =========================================================================
     # Pre/post-call guardrails (inspired by PR #1321 — @alireza78a)
@@ -8108,8 +8127,9 @@ class AIAgent:
                 api_messages.append(api_msg)
 
             effective_system = self._cached_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            runtime_addendum = self._runtime_system_addendum()
+            if runtime_addendum:
+                effective_system = (effective_system + "\n\n" + runtime_addendum).strip()
             if effective_system:
                 api_messages = [{"role": "system", "content": effective_system}] + api_messages
             if self.prefill_messages:
@@ -8715,8 +8735,9 @@ class AIAgent:
             # External recall context is injected into the user message, not the system
             # prompt, so the stable cache prefix remains unchanged.
             effective_system = active_system_prompt or ""
-            if self.ephemeral_system_prompt:
-                effective_system = (effective_system + "\n\n" + self.ephemeral_system_prompt).strip()
+            runtime_addendum = self._runtime_system_addendum()
+            if runtime_addendum:
+                effective_system = (effective_system + "\n\n" + runtime_addendum).strip()
             # NOTE: Plugin context from pre_llm_call hooks is injected into the
             # user message (see injection block above), NOT the system prompt.
             # This is intentional — system prompt modifications break the prompt

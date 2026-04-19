@@ -147,6 +147,10 @@ COMMAND_REGISTRY: list[CommandDef] = [
     # Info
     CommandDef("commands", "Browse all commands and skills (paginated)", "Info",
                gateway_only=True, args_hint="[page]"),
+    CommandDef("tasksync", "Show linked task channels or broadcast an update across them", "Session",
+               gateway_only=True, aliases=("tsync",),
+               args_hint="[<message> | links [task-id] | broadcast [task-id] <message>]",
+               subcommands=("links", "broadcast")),
     CommandDef("help", "Show available commands", "Info"),
     CommandDef("restart", "Gracefully restart the gateway after draining active runs", "Session",
                gateway_only=True),

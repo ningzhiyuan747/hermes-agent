@@ -3026,6 +3026,9 @@ class GatewayRunner:
 
         if canonical == "commands":
             return await self._handle_commands_command(event)
+
+        if canonical == "tasksync":
+            return await self._handle_tasksync_command(event)
         
         if canonical == "profile":
             return await self._handle_profile_command(event)
@@ -4629,6 +4632,28 @@ class GatewayRunner:
         if page != requested_page:
             lines.append(f"_(Requested page {requested_page} was out of range, showing page {page}.)_")
         return "\n".join(lines)
+
+    async def _handle_tasksync_command(self, event: MessageEvent) -> str:
+        """Handle /tasksync for task-linked channel discovery and broadcast."""
+        try:
+            from agent.business_command_service import dispatch_tasksync_command
+            from gateway.platforms.incoming_message_factory import build_incoming_message_for_event
+        except Exception as exc:
+            logger.exception("Failed to import task sync helpers")
+            return f"任务同步模块当前不可用：{exc}"
+
+        source = event.source
+        platform_name = source.platform.value if source.platform else ""
+        raw_args = event.get_command_args().strip()
+        return dispatch_tasksync_command(
+            build_incoming_message_for_event(
+                event,
+                platform_name=platform_name,
+                session_key=build_session_key(source),
+            ),
+            raw_args,
+            usage_command="/tasksync",
+        )
     
     async def _handle_model_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /model command — switch model for this session.
@@ -7355,6 +7380,7 @@ class GatewayRunner:
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
+            chat_type=context.source.chat_type or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",

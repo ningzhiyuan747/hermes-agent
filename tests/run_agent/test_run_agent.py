@@ -673,6 +673,24 @@ class TestBuildSystemPrompt:
         prompt = agent._build_system_prompt()
         assert "NOUS SUBSCRIPTION BLOCK" in prompt
 
+    def test_gateway_session_skips_global_builtin_memory_blocks(self, agent, monkeypatch):
+        from gateway import session_context
+
+        agent._memory_enabled = True
+        agent._user_profile_enabled = True
+        agent._memory_store = SimpleNamespace(
+            format_for_system_prompt=lambda target: {
+                "memory": "GLOBAL MEMORY BLOCK",
+                "user": "GLOBAL USER BLOCK",
+            }.get(target)
+        )
+        monkeypatch.setattr(session_context, "get_session_env", lambda name, default="": "feishu" if name == "HERMES_SESSION_PLATFORM" else default)
+
+        prompt = agent._build_system_prompt()
+
+        assert "GLOBAL MEMORY BLOCK" not in prompt
+        assert "GLOBAL USER BLOCK" not in prompt
+
     def test_skills_prompt_derives_available_toolsets_from_loaded_tools(self):
         tools = _make_tool_defs("web_search", "skills_list", "skill_view", "skill_manage")
         toolset_map = {
