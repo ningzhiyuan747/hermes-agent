@@ -27,10 +27,18 @@ def build_task_scope_key(
     return ""
 
 
-def _payload_task_scope_key(payload: Any) -> str:
+def _payload_key(payload: Any, key: str) -> str:
     if not isinstance(payload, dict):
         return ""
-    return str(payload.get("task_scope_key") or "").strip()
+    return str(payload.get(key) or "").strip()
+
+
+def _payload_task_scope_key(payload: Any) -> str:
+    return _payload_key(payload, "task_scope_key")
+
+
+def _payload_person_memory_key(payload: Any) -> str:
+    return _payload_key(payload, "person_memory_key")
 
 
 def extract_capability_run_task_scope_key(row: Dict[str, Any]) -> str:
@@ -38,6 +46,14 @@ def extract_capability_run_task_scope_key(row: Dict[str, Any]) -> str:
         str(row.get("task_scope_key") or "").strip()
         or _payload_task_scope_key(row.get("output"))
         or _payload_task_scope_key(row.get("input"))
+    )
+
+
+def extract_capability_run_person_memory_key(row: Dict[str, Any]) -> str:
+    return (
+        str(row.get("person_memory_key") or "").strip()
+        or _payload_person_memory_key(row.get("output"))
+        or _payload_person_memory_key(row.get("input"))
     )
 
 
@@ -57,6 +73,15 @@ def extract_background_job_task_scope_key(row: Dict[str, Any]) -> str:
         str(row.get("task_scope_key") or "").strip()
         or _job_tag_value(tags, "task_scope")
         or _payload_task_scope_key(row.get("payload"))
+    )
+
+
+def extract_background_job_person_memory_key(row: Dict[str, Any]) -> str:
+    tags = [str(item).strip().lower() for item in (row.get("tags") or []) if str(item).strip()]
+    return (
+        str(row.get("person_memory_key") or "").strip()
+        or _job_tag_value(tags, "person_memory")
+        or _payload_person_memory_key(row.get("payload"))
     )
 
 
@@ -116,6 +141,8 @@ def enrich_capability_run_payload(
 ) -> Dict[str, Any]:
     record = dict(payload)
     record["trace_id"] = str(record.get("trace_id") or "").strip()
+    record["task_scope_key"] = extract_capability_run_task_scope_key(record)
+    record["person_memory_key"] = extract_capability_run_person_memory_key(record)
     if task_id:
         record["task_id"] = task_id
         record["task_title"] = task_title
@@ -190,6 +217,8 @@ def _apply_scope_metadata(
         payload["task_title"] = task_title
     if task_scope_key:
         payload["task_scope_key"] = task_scope_key
+    if not str(payload.get("person_memory_key") or "").strip():
+        payload["person_memory_key"] = extract_capability_run_person_memory_key(payload) or extract_background_job_person_memory_key(payload)
     return payload
 
 
@@ -204,17 +233,20 @@ def enrich_background_job_payload(
     record["tags"] = tags
     record["trace_id"] = str(record.get("trace_id") or "").strip()
     record["task_scope_key"] = extract_background_job_task_scope_key(record)
+    record["person_memory_key"] = extract_background_job_person_memory_key(record)
     run = _find_capability_run_for_job(record, tags, str(record.get("job_id") or "").strip(), runs=runs)
     if run is None:
         return record
     run_id = str(run.get("run_id") or "").strip()
     run_task_scope_key = extract_capability_run_task_scope_key(run)
+    run_person_memory_key = extract_capability_run_person_memory_key(run)
     record.update(
         {
             "trace_id": str(run.get("trace_id") or "").strip() or str(record.get("trace_id") or "").strip(),
             "capability_run_id": run_id,
             "task_id": str(run.get("task_id") or "").strip(),
             "task_scope_key": run_task_scope_key or str(record.get("task_scope_key") or "").strip(),
+            "person_memory_key": run_person_memory_key or str(record.get("person_memory_key") or "").strip(),
             "capability_name": str(run.get("capability_name") or "").strip(),
             "capability_status": str(run.get("status") or "").strip(),
             "approval_id": str(run.get("approval_id") or "").strip(),

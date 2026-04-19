@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from typing import Any, Dict, List
 
+from agent.capability_snapshots import (
+    extract_background_job_person_memory_key,
+    extract_background_job_task_scope_key,
+    extract_capability_run_person_memory_key,
+    extract_capability_run_task_scope_key,
+)
+
 
 def _artifact_priority(item: Dict[str, Any]) -> tuple[int, int, str]:
     metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
@@ -71,6 +78,11 @@ def format_task_panel_snapshot(snapshot: Dict[str, Any], *, header: str = "当�
         )
     if approvals:
         lines.append(f"待审批: {len(approvals)}")
+    for scope_payload in (current_run, current_job):
+        scope_lines = _scope_lines(scope_payload, fullwidth_colon=fullwidth_colon)
+        if scope_lines:
+            lines.extend(scope_lines)
+            break
     if artifact_items:
         lines.append("最近产物:")
         for artifact in sorted_artifact_items(artifact_items)[:3]:
@@ -114,6 +126,24 @@ def _origin_line(payload: Dict[str, Any], *, fullwidth_colon: bool = False) -> s
     return f"来源{colon} {origin_platform or '-'} / {origin_chat_name or origin_chat_id or '-'}"
 
 
+def _scope_lines(payload: Dict[str, Any], *, fullwidth_colon: bool = False) -> List[str]:
+    if not isinstance(payload, dict) or not payload:
+        return []
+    colon = "：" if fullwidth_colon else ":"
+    lines: List[str] = []
+    if str(payload.get("job_id") or "").strip():
+        task_scope_key = extract_background_job_task_scope_key(payload)
+        person_memory_key = extract_background_job_person_memory_key(payload)
+    else:
+        task_scope_key = extract_capability_run_task_scope_key(payload)
+        person_memory_key = extract_capability_run_person_memory_key(payload)
+    if task_scope_key:
+        lines.append(f"Task scope{colon} {task_scope_key[:120]}")
+    if person_memory_key:
+        lines.append(f"Person memory{colon} {person_memory_key[:120]}")
+    return lines
+
+
 def format_capability_run_snapshot_lines(
     run: Dict[str, Any],
     *,
@@ -148,6 +178,7 @@ def format_capability_run_snapshot_lines(
         lines.append(f"阻塞{colon} {blocker[:120]}")
     if result:
         lines.append(f"结果摘要{colon} {result[:120]}")
+    lines.extend(_scope_lines(run, fullwidth_colon=fullwidth_colon))
     artifact_items = run.get("artifact_items") if isinstance(run.get("artifact_items"), list) else []
     for artifact in sorted_artifact_items(artifact_items)[:3]:
         lines.append(format_artifact_line(artifact, fullwidth_colon=fullwidth_colon))
@@ -225,6 +256,7 @@ def format_background_job_snapshot_lines(
         lines.append(f"Run blocker{colon} {capability_blocker[:120]}")
     if capability_result:
         lines.append(f"Result{colon} {capability_result[:120]}")
+    lines.extend(_scope_lines(job, fullwidth_colon=fullwidth_colon))
     artifact_items = job.get("artifact_items") if isinstance(job.get("artifact_items"), list) else []
     for artifact in sorted_artifact_items(artifact_items)[:3]:
         lines.append(format_artifact_line(artifact, fullwidth_colon=fullwidth_colon))

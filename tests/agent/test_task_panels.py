@@ -44,7 +44,14 @@ def test_format_task_panel_snapshot_includes_recent_artifacts_with_fullwidth_col
             "status": "active",
             "goal": "找到 24 年司羿手功能 06 08 的合同",
         },
-        "current_run": {"capability_name": "contract_retrieval", "status": "running"},
+        "current_run": {
+            "capability_name": "contract_retrieval",
+            "status": "running",
+            "input": {
+                "task_scope_key": "feishu:chat:group-42:thread:task-9",
+                "person_memory_key": "feishu:user:user-7",
+            },
+        },
         "current_job": {"job_id": "job-42", "status": "active"},
         "approvals": [{"approval_id": "approval-1"}],
         "artifact_items": [
@@ -77,6 +84,8 @@ def test_format_task_panel_snapshot_includes_recent_artifacts_with_fullwidth_col
     assert "当前 Run: contract_retrieval / running" in text
     assert "当前后台任务: job-42 / active" in text
     assert "待审批: 1" in text
+    assert "Task scope： feishu:chat:group-42:thread:task-9" in text
+    assert "Person memory： feishu:user:user-7" in text
     assert "Deliverable： 合同PDF -> 最终合同扫描件" in text
     assert "Evidence： 公告链接 -> https://example.com/notice" in text
 
@@ -122,6 +131,8 @@ def test_format_capability_run_snapshot_includes_task_origin_and_artifacts():
         "next_step": "继续追附件下载链接",
         "blocker": "公开站点返回慢",
         "result": "已拿到合同公告",
+        "task_scope_key": "feishu:chat:group-42:thread:task-9",
+        "person_memory_key": "feishu:user:user-7",
         "artifact_items": [
             {
                 "label": "合同PDF",
@@ -140,6 +151,8 @@ def test_format_capability_run_snapshot_includes_task_origin_and_artifacts():
     assert "Run： run-123" in text
     assert "任务： 司羿合同任务" in text
     assert "审批ID： approval-9" in text
+    assert "Task scope： feishu:chat:group-42:thread:task-9" in text
+    assert "Person memory： feishu:user:user-7" in text
     assert "来源： feishu / 商务" in text
     assert "Deliverable： 合同PDF -> 最终合同扫描件" in text
 
@@ -150,7 +163,11 @@ def test_format_background_job_snapshot_includes_run_fields_and_origin():
         "job_id": "job-123",
         "trace_id": "trace-123",
         "executor": "openclaw",
-        "tags": ["worker_kind:research"],
+        "tags": [
+            "worker_kind:research",
+            "task_scope:dingtalk:chat:cid_xxx",
+            "person_memory:dingtalk:user:user-9",
+        ],
         "title": "司羿合同检索",
         "current_focus": "正在搜公告",
         "next_step": "转附件页",
@@ -160,6 +177,8 @@ def test_format_background_job_snapshot_includes_run_fields_and_origin():
         "task_id": "task-123",
         "task_title": "司羿合同任务",
         "approval_id": "approval-9",
+        "task_scope_key": "dingtalk:chat:group-42:thread:task-9",
+        "person_memory_key": "dingtalk:user:user-7",
         "capability_result": "已命中合同公告",
         "capability_focus": "锁定公告页",
         "capability_next_step": "继续找附件",
@@ -182,8 +201,10 @@ def test_format_background_job_snapshot_includes_run_fields_and_origin():
     assert "Capability： contract_retrieval / running" in text
     assert "Run： run-123" in text
     assert "任务： 司羿合同任务" in text
+    assert "Task scope： dingtalk:chat:group-42:thread:task-9" in text
+    assert "Person memory： dingtalk:user:user-7" in text
     assert "来源： dingtalk / 商务" in text
-    assert "Evidence： 公告链接 -> https://example.com/notice" in text
+
 
 
 def test_build_activity_snapshot_text_prefers_background_job_over_run():

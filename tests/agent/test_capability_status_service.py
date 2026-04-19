@@ -5,7 +5,13 @@ def test_get_background_job_snapshot_uses_shared_task_binding(monkeypatch):
     monkeypatch.setattr(
         service,
         "list_jobs",
-        lambda limit=0, active_only=True: [{"job_id": "job-1", "tags": ["executor:openclaw"], "session_id": "sess-1"}],
+        lambda limit=0, active_only=True: [
+            {
+                "job_id": "job-1",
+                "tags": ["executor:openclaw", "person_memory:feishu:user:user-7"],
+                "session_id": "sess-1",
+            }
+        ],
     )
     monkeypatch.setattr(
         service,
@@ -33,6 +39,7 @@ def test_get_background_job_snapshot_uses_shared_task_binding(monkeypatch):
     assert result["job_id"] == "job-1"
     assert result["task_id"] == "task-1"
     assert result["capability_run_id"] == "run-1"
+    assert result["person_memory_key"] == "feishu:user:user-7"
 
 
 def test_get_capability_run_snapshot_supports_task_binding_without_session_match(monkeypatch):
@@ -220,7 +227,10 @@ def test_get_capability_run_snapshot_prefers_task_scope_key_from_run_payload(mon
                 "task_id": "",
                 "status": "running",
                 "updated_at_unix": 20,
-                "output": {"task_scope_key": "feishu:chat:chat-1:thread:topic-1"},
+                "output": {
+                    "task_scope_key": "feishu:chat:chat-1:thread:topic-1",
+                    "person_memory_key": "feishu:user:user-7",
+                },
             },
         ],
     )
@@ -237,6 +247,7 @@ def test_get_capability_run_snapshot_prefers_task_scope_key_from_run_payload(mon
     assert result is not None
     assert result["run_id"] == "run-2"
     assert result["task_scope_key"] == "feishu:chat:chat-1:thread:topic-1"
+    assert result["person_memory_key"] == "feishu:user:user-7"
 
 
 def test_cancel_background_jobs_prefers_task_scope_key_over_session_match(monkeypatch):
