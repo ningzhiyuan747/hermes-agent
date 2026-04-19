@@ -98,6 +98,7 @@ def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):
             "capability_run:run-123",
             "task_scope:feishu:chat:Group-42:thread:Task-9",
             "person_memory:feishu:user:User-7",
+            "conversation_role:chat_surface",
         ],
     }
 
@@ -136,6 +137,7 @@ def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):
                 "background_job_status": "completed",
                 "task_scope_key": "feishu:chat:Group-42:thread:Task-9",
                 "person_memory_key": "feishu:user:User-7",
+                "conversation_role": "chat_surface",
             },
         }
     ]

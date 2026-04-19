@@ -97,10 +97,13 @@ def _scope_payload_from_job(job: dict) -> dict[str, str]:
     payload: dict[str, str] = {}
     task_scope_key = _tag_value(job, "task_scope")
     person_memory_key = _tag_value(job, "person_memory")
+    conversation_role = _tag_value(job, "conversation_role")
     if task_scope_key:
         payload["task_scope_key"] = task_scope_key
     if person_memory_key:
         payload["person_memory_key"] = person_memory_key
+    if conversation_role:
+        payload["conversation_role"] = conversation_role
     return payload
 
 

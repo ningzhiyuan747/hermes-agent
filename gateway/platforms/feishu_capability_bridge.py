@@ -264,20 +264,37 @@ class FeishuCapabilityBridge:
         )
 
     @staticmethod
-    def _scope_fields(*, platform: str, chat_id: str, thread_id: str, actor_user_id: str) -> Dict[str, str]:
+    def _scope_fields(
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: str,
+        actor_user_id: str,
+        session_id: str = "",
+    ) -> Dict[str, str]:
         platform_value = str(platform or "").strip().lower()
         chat_value = str(chat_id or "").strip()
         thread_value = str(thread_id or "").strip()
         actor_value = str(actor_user_id or "").strip()
+        session_value = str(session_id or "").strip()
         task_scope_key = ""
         if platform_value and chat_value:
             task_scope_key = f"{platform_value}:chat:{chat_value}"
             if thread_value:
                 task_scope_key += f":thread:{thread_value}"
         person_memory_key = f"{platform_value}:user:{actor_value}" if platform_value and actor_value else ""
+        if platform_value == "dingtalk" and chat_value:
+            conversation_role = "task_group"
+        elif chat_value:
+            conversation_role = "chat_surface"
+        elif session_value:
+            conversation_role = "task_unit"
+        else:
+            conversation_role = "system"
         return {
             "task_scope_key": task_scope_key,
             "person_memory_key": person_memory_key,
+            "conversation_role": conversation_role,
         }
 
     def build_effective_question(self, question: str) -> str:
@@ -317,6 +334,7 @@ class FeishuCapabilityBridge:
     ) -> Optional[Dict[str, Any]]:
         if create_capability_run_func is None:
             return None
+        session_key = session_key_builder(event)
         origin = {
             "platform": "feishu",
             "chat_id": str(event.source.chat_id or "").strip(),
@@ -330,6 +348,7 @@ class FeishuCapabilityBridge:
             chat_id=origin["chat_id"],
             thread_id=origin["thread_id"],
             actor_user_id=actor_user_id,
+            session_id=session_key,
         )
         try:
             return create_capability_run_func(
@@ -338,7 +357,7 @@ class FeishuCapabilityBridge:
                 goal=str(event.text or "").strip(),
                 origin=origin,
                 actor_user_id=actor_user_id,
-                session_id=session_key_builder(event),
+                session_id=session_key,
                 priority="normal",
                 input_data={
                     "message_id": str(event.message_id or "").strip(),
@@ -378,6 +397,7 @@ class FeishuCapabilityBridge:
             chat_id=origin["chat_id"],
             thread_id=origin["thread_id"],
             actor_user_id=actor_user_id,
+            session_id=session_key,
         )
         record = create_job_func(
             title=str(route.get("title") or ((event.text or "")[:80])).strip(),
@@ -412,6 +432,11 @@ class FeishuCapabilityBridge:
             + (
                 [f"person_memory:{str(scopes.get('person_memory_key') or '').strip()}"]
                 if str(scopes.get("person_memory_key") or "").strip()
+                else []
+            )
+            + (
+                [f"conversation_role:{str(scopes.get('conversation_role') or '').strip()}"]
+                if str(scopes.get("conversation_role") or "").strip()
                 else []
             )
             + (
