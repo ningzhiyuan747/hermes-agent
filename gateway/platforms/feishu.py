@@ -3612,6 +3612,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     format_task_panel_snapshot_func=format_task_panel_snapshot,
                     list_jobs_func=list_jobs,
                     build_activity_snapshot_text_func=build_activity_snapshot_text,
+                    get_operational_task_board_text_func=self._get_operational_task_board_text,
                 )
             )
         return self._status_service
@@ -3876,6 +3877,59 @@ class FeishuAdapter(BasePlatformAdapter):
         if completed.returncode != 0:
             payload.setdefault("ok", False)
         return payload
+
+    def _get_operational_task_board_text(self) -> str:
+        control_plane_script = Path(os.getenv("HERMES_DINGTALK_CONTROL_PLANE_SCRIPT", str(_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT)))
+        if not control_plane_script.exists():
+            return "统一任务板暂不可用。"
+        powershell_bin = os.getenv("WINDOWS_POWERSHELL_BIN", _DEFAULT_WINDOWS_POWERSHELL).strip() or _DEFAULT_WINDOWS_POWERSHELL
+
+        def _to_windows_path(path: Path) -> str:
+            raw = str(path)
+            if raw.startswith("/mnt/") and len(raw) > 6 and raw[5].isalpha() and raw[6] == "/":
+                drive = raw[5].upper()
+                rest = raw[7:].replace("/", "\\")
+                return f"{drive}:\\{rest}"
+            return raw
+
+        control_plane_windows_path = _to_windows_path(control_plane_script)
+
+        def _decode_output(raw: bytes) -> str:
+            if not raw:
+                return ""
+            for encoding in ("utf-8", "gb18030", "cp936"):
+                try:
+                    return raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", errors="replace")
+
+        completed = subprocess.run(
+            [
+                powershell_bin,
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                control_plane_windows_path,
+                "task-board",
+            ],
+            capture_output=True,
+            text=False,
+            timeout=30,
+            check=False,
+        )
+        output = _decode_output(completed.stdout or completed.stderr or b"").strip()
+        if completed.returncode != 0 or not output:
+            return "统一任务板暂不可用。"
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return output
+        message = str(payload.get("message") or "").strip()
+        return message or "统一任务板暂不可用。"
 
     async def _get_dingtalk_bridge_status(self) -> str:
         control_plane_script = Path(os.getenv("HERMES_DINGTALK_CONTROL_PLANE_SCRIPT", str(_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT)))

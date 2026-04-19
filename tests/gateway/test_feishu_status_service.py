@@ -61,3 +61,36 @@ def test_get_background_job_snapshot_uses_capability_bridge_context():
         chat_id="oc_task_group",
         thread_id="",
     )
+
+
+def test_format_activity_snapshot_falls_back_to_operational_task_board_text():
+    capability_bridge = Mock()
+    formatter = Mock(return_value="")
+    service = FeishuStatusService(
+        FeishuStatusServiceDeps(
+            capability_bridge=capability_bridge,
+            build_activity_snapshot_text_func=formatter,
+            get_operational_task_board_text_func=Mock(return_value="统一任务板摘要"),
+        )
+    )
+
+    text = service.format_activity_snapshot()
+
+    assert text == "统一任务板摘要"
+    formatter.assert_called_once_with(None, None, fullwidth_colon=True)
+
+
+def test_format_activity_snapshot_prefers_concrete_job_or_run_text():
+    capability_bridge = Mock()
+    formatter = Mock(return_value="后台任务状态")
+    service = FeishuStatusService(
+        FeishuStatusServiceDeps(
+            capability_bridge=capability_bridge,
+            build_activity_snapshot_text_func=formatter,
+            get_operational_task_board_text_func=Mock(return_value="统一任务板摘要"),
+        )
+    )
+
+    text = service.format_activity_snapshot(job={"job_id": "job-1"})
+
+    assert text == "后台任务状态"

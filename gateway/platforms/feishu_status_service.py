@@ -16,6 +16,7 @@ class FeishuStatusServiceDeps:
     format_task_panel_snapshot_func: Callable[..., str] | None = None
     list_jobs_func: Callable[..., list[Dict[str, Any]]] | None = None
     build_activity_snapshot_text_func: Callable[..., str] | None = None
+    get_operational_task_board_text_func: Callable[[], str] | None = None
 
 
 class FeishuStatusService:
@@ -135,5 +136,20 @@ class FeishuStatusService:
                 return self.deps.capability_bridge.format_background_job_snapshot(job)
             if run:
                 return self.deps.capability_bridge.format_capability_run_snapshot(run)
+            task_board_func = self.deps.get_operational_task_board_text_func
+            if task_board_func is not None:
+                try:
+                    return task_board_func()
+                except Exception:
+                    return ""
             return ""
-        return func(job, run, fullwidth_colon=True)
+        text = func(job, run, fullwidth_colon=True)
+        if text:
+            return text
+        task_board_func = self.deps.get_operational_task_board_text_func
+        if task_board_func is not None:
+            try:
+                return task_board_func()
+            except Exception:
+                return ""
+        return ""

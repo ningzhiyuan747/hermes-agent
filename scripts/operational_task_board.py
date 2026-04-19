@@ -60,9 +60,17 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     lines.append(f"- 状态分布: {job_counts or {'none': 0}}")
     lines.append(f"- 活跃数: {len(active_jobs)}")
     for row in active_jobs[:limit]:
+        scope_bits = []
+        task_scope_key = str(row.get("task_scope_key") or "").strip()
+        person_memory_key = str(row.get("person_memory_key") or "").strip()
+        if task_scope_key:
+            scope_bits.append(f"task_scope={task_scope_key}")
+        if person_memory_key:
+            scope_bits.append(f"person_memory={person_memory_key}")
+        scope_suffix = f" | {' | '.join(scope_bits)}" if scope_bits else ""
         lines.append(
             f"  - {str(row.get('related_ids', {}).get('job_id') or row.get('unit_id') or '-').strip()} | {str(row.get('status') or '-').strip()} | "
-            f"{_short(row.get('title') or '-', 90)}"
+            f"{_short(row.get('title') or '-', 90)}{scope_suffix}"
         )
 
     lines.extend(["", "三、子智能体任务（delegation tasks）"])
@@ -84,6 +92,19 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
         lines.append(f"- 背景任务失败较多（failed={job_counts.get('failed', 0)}），说明后台执行链路仍需持续收敛。")
     if run_counts.get("queued", 0):
         lines.append(f"- capability run 中 queued 较多（queued={run_counts.get('queued', 0)}），需要继续推进状态回填与统一调度。")
+    scope_summary = snapshot.get("scope_summary") if isinstance(snapshot.get("scope_summary"), dict) else {}
+    top_task_scopes = scope_summary.get("task_scopes") if isinstance(scope_summary.get("task_scopes"), dict) else {}
+    top_person_memories = scope_summary.get("person_memories") if isinstance(scope_summary.get("person_memories"), dict) else {}
+    top_roles = scope_summary.get("conversation_roles") if isinstance(scope_summary.get("conversation_roles"), dict) else {}
+    if top_task_scopes:
+        lines.append(f"- 任务面热点: {top_task_scopes}")
+    if top_person_memories:
+        lines.append(f"- 人物记忆热点: {top_person_memories}")
+    if top_roles:
+        lines.append(f"- 会话角色分布: {top_roles}")
+    derived_signals = snapshot.get("derived_signals") if isinstance(snapshot.get("derived_signals"), list) else []
+    for signal in derived_signals[:limit]:
+        lines.append(f"- {signal}")
     return "\n".join(lines)
 
 
