@@ -49,6 +49,26 @@ _KNOWN_DELIVERY_PLATFORMS = frozenset({
     "qqbot",
 })
 
+# Preserve legacy fallback order for common chat apps, then cover the rest of the
+# supported delivery platforms deterministically so origin-less cron jobs can still
+# reach a configured *_HOME_CHANNEL.
+_HOME_CHANNEL_FALLBACK_PRIORITY = (
+    "matrix",
+    "telegram",
+    "discord",
+    "slack",
+    "bluebubbles",
+)
+
+
+def _iter_home_channel_fallback_platforms():
+    seen: set[str] = set()
+    for platform_name in (*_HOME_CHANNEL_FALLBACK_PRIORITY, *sorted(_KNOWN_DELIVERY_PLATFORMS)):
+        if platform_name in seen or platform_name in {"homeassistant", "webhook"}:
+            continue
+        seen.add(platform_name)
+        yield platform_name
+
 from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_run
 
 # Sentinel: when a cron agent has nothing new to report, it can start its
@@ -57,11 +77,32 @@ from cron.jobs import get_due_jobs, mark_job_run, save_job_output, advance_next_
 SILENT_MARKER = "[SILENT]"
 
 # Resolve Hermes home directory (respects HERMES_HOME override)
-_hermes_home = get_hermes_home()
+_DEFAULT_HERMES_HOME = get_hermes_home()
+_hermes_home = _DEFAULT_HERMES_HOME
 
-# File-based lock prevents concurrent ticks from gateway + daemon + systemd timer
-_LOCK_DIR = _hermes_home / "cron"
-_LOCK_FILE = _LOCK_DIR / ".tick.lock"
+
+def _resolve_hermes_home() -> Path:
+    """Resolve Hermes home at call time while preserving test patchability.
+
+    - Normal runtime: follow the current HERMES_HOME env via get_hermes_home().
+    - Tests that patch ``cron.scheduler._hermes_home`` still win explicitly.
+    """
+    if _hermes_home != _DEFAULT_HERMES_HOME:
+        return Path(_hermes_home)
+    return get_hermes_home()
+
+
+def _lock_dir() -> Path:
+    """Resolve the cron lock directory at call time.
+
+    Tests patch ``_hermes_home`` after module import, so this must not be frozen
+    into a module-level Path constant.
+    """
+    return _resolve_hermes_home() / "cron"
+
+
+def _lock_file() -> Path:
+    return _lock_dir() / ".tick.lock"
 
 
 def _resolve_origin(job: dict) -> Optional[dict]:
@@ -93,7 +134,7 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
             }
         # Origin missing (e.g. job created via API/script) — try each
         # platform's home channel as a fallback instead of silently dropping.
-        for platform_name in ("matrix", "telegram", "discord", "slack", "bluebubbles"):
+        for platform_name in _iter_home_channel_fallback_platforms():
             chat_id = os.getenv(f"{platform_name.upper()}_HOME_CHANNEL", "")
             if chat_id:
                 logger.info(
@@ -612,13 +653,16 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             os.environ["HERMES_SESSION_CHAT_ID"] = str(origin["chat_id"])
             if origin.get("chat_name"):
                 os.environ["HERMES_SESSION_CHAT_NAME"] = origin["chat_name"]
-        # Re-read .env and config.yaml fresh every run so provider/key
-        # changes take effect without a gateway restart.
+
+        # Re-read .env and config.yaml fresh every run so provider/key changes
+        # take effect without a gateway restart.
+        hermes_home = _resolve_hermes_home()
+
         from dotenv import load_dotenv
         try:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="utf-8")
+            load_dotenv(str(hermes_home / ".env"), override=True, encoding="utf-8")
         except UnicodeDecodeError:
-            load_dotenv(str(_hermes_home / ".env"), override=True, encoding="latin-1")
+            load_dotenv(str(hermes_home / ".env"), override=True, encoding="latin-1")
 
         delivery_target = _resolve_delivery_target(job)
         if delivery_target:
@@ -633,7 +677,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         _cfg = {}
         try:
             import yaml
-            _cfg_path = str(_hermes_home / "config.yaml")
+            _cfg_path = str(hermes_home / "config.yaml")
             if os.path.exists(_cfg_path):
                 with open(_cfg_path) as _f:
                     _cfg = yaml.safe_load(_f) or {}
@@ -667,7 +711,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
             import json as _json
             pfpath = Path(prefill_file).expanduser()
             if not pfpath.is_absolute():
-                pfpath = _hermes_home / pfpath
+                pfpath = hermes_home / pfpath
             if pfpath.exists():
                 try:
                     with open(pfpath, "r", encoding="utf-8") as _pf:
@@ -921,12 +965,14 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
     Returns:
         Number of jobs executed (0 if another tick is already running)
     """
-    _LOCK_DIR.mkdir(parents=True, exist_ok=True)
+    lock_dir = _lock_dir()
+    lock_file = _lock_file()
+    lock_dir.mkdir(parents=True, exist_ok=True)
 
     # Cross-platform file locking: fcntl on Unix, msvcrt on Windows
     lock_fd = None
     try:
-        lock_fd = open(_LOCK_FILE, "w")
+        lock_fd = open(lock_file, "w")
         if fcntl:
             fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         elif msvcrt:
