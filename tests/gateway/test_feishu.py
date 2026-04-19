@@ -181,6 +181,51 @@ class TestFeishuMessageNormalization(unittest.TestCase):
         )
 
 
+class TestFeishuOperationalTaskBoard(unittest.TestCase):
+    def test_get_operational_task_board_text_returns_message_from_control_plane_json(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "control-plane.ps1"
+            script_path.write_text("Write-Output '{}'", encoding="utf-8")
+            completed = SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({"message": "统一任务板摘要"}).encode("utf-8"),
+                stderr=b"",
+            )
+            with (
+                patch.dict(os.environ, {"HERMES_DINGTALK_CONTROL_PLANE_SCRIPT": str(script_path)}, clear=False),
+                patch("gateway.platforms.feishu.subprocess.run", return_value=completed) as run_mock,
+            ):
+                text = adapter._get_operational_task_board_text()
+
+        self.assertEqual(text, "统一任务板摘要")
+        run_mock.assert_called_once()
+        command = run_mock.call_args.args[0]
+        self.assertEqual(command[-2], str(script_path))
+        self.assertEqual(command[-1], "task-board")
+        self.assertEqual(command[-3], "-File")
+
+    def test_get_operational_task_board_text_returns_unavailable_when_control_plane_fails(self):
+        from gateway.config import PlatformConfig
+        from gateway.platforms.feishu import FeishuAdapter
+
+        adapter = FeishuAdapter(PlatformConfig())
+        with tempfile.TemporaryDirectory() as tmpdir:
+            script_path = Path(tmpdir) / "control-plane.ps1"
+            script_path.write_text("Write-Error 'boom'", encoding="utf-8")
+            completed = SimpleNamespace(returncode=1, stdout=b"", stderr=b"boom")
+            with (
+                patch.dict(os.environ, {"HERMES_DINGTALK_CONTROL_PLANE_SCRIPT": str(script_path)}, clear=False),
+                patch("gateway.platforms.feishu.subprocess.run", return_value=completed),
+            ):
+                text = adapter._get_operational_task_board_text()
+
+        self.assertEqual(text, "统一任务板暂不可用。")
+
+
 class TestFeishuAdapterMessaging(unittest.TestCase):
     @patch.dict(os.environ, {
         "FEISHU_APP_ID": "cli_app",
