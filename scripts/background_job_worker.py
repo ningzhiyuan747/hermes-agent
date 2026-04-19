@@ -34,6 +34,11 @@ from agent.background_jobs import (
 from agent.outbound_delivery import DeliveryTarget, send_text_to_target
 from agent.user_profile_distiller import distill_recent_users
 
+try:
+    from agent.business_db import update_capability_run
+except Exception:
+    update_capability_run = None  # type: ignore[assignment]
+
 
 MAX_DELIVERY_CHARS = int(os.getenv("HERMES_BACKGROUND_JOB_DELIVERY_CHARS", "3200"))
 OPENCLAW_AGENT = str(os.getenv("HERMES_OPENCLAW_AGENT", "hermes-research") or "hermes-research").strip()
@@ -73,6 +78,36 @@ def _job_tags(job: dict) -> set[str]:
         for item in (job.get("tags") or [])
         if str(item).strip()
     }
+
+
+def _capability_run_id(job: dict) -> str:
+    for tag in _job_tags(job):
+        if tag.startswith("capability_run:"):
+            return tag.split(":", 1)[1].strip()
+    return ""
+
+
+def _sync_capability_run_status(job: dict, *, status: str, current_focus: str, next_step: str, result: str = "", blocker: str = "") -> None:
+    run_id = _capability_run_id(job)
+    if not run_id or update_capability_run is None:
+        return
+    payload = {"background_job_status": status}
+    if result:
+        payload["background_job_result"] = result
+    if blocker:
+        payload["background_job_blocker"] = blocker
+    try:
+        update_capability_run(
+            run_id,
+            status=status,
+            current_focus=current_focus,
+            next_step=next_step,
+            result=result or None,
+            blocker=blocker or None,
+            output=payload,
+        )
+    except Exception:
+        pass
 
 
 def _requested_runtime(job: dict) -> str:
@@ -529,6 +564,13 @@ def run_one(timeout: int, executor: str) -> bool:
                 next_step="Review the stored result; delivery to the originating chat has been attempted when available.",
                 result=output,
             )
+            _sync_capability_run_status(
+                job,
+                status="completed",
+                current_focus="Background job completed.",
+                next_step="Review the stored result delivered from the background worker.",
+                result=output,
+            )
             append_job_event(
                 job_id,
                 kind="completed",
@@ -546,6 +588,14 @@ def run_one(timeout: int, executor: str) -> bool:
                 blocker=error or output or f"{exit_label} exited with code {returncode}",
                 result=output,
             )
+            _sync_capability_run_status(
+                job,
+                status="failed",
+                current_focus=f"Background job failed during {failure_stage}.",
+                next_step="Inspect the worker error and retry the capability run if needed.",
+                result=output,
+                blocker=error or output or f"{exit_label} exited with code {returncode}",
+            )
             append_job_event(job_id, kind="failed", message=error or output or f"exit code {returncode}")
             if failed_job:
                 _deliver_job_result(failed_job, failed=True)
@@ -556,6 +606,13 @@ def run_one(timeout: int, executor: str) -> bool:
             current_focus="Background job timed out.",
             blocker=f"Execution exceeded {timeout} seconds.",
         )
+        _sync_capability_run_status(
+            job,
+            status="failed",
+            current_focus="Background job timed out.",
+            next_step="Inspect why the worker stalled and retry if appropriate.",
+            blocker=f"Execution exceeded {timeout} seconds.",
+        )
         append_job_event(job_id, kind="timeout", message=f"Execution exceeded {timeout} seconds.")
         if failed_job:
             _deliver_job_result(failed_job, failed=True)
@@ -564,6 +621,13 @@ def run_one(timeout: int, executor: str) -> bool:
             job_id,
             status="failed",
             current_focus="Background job crashed.",
+            blocker=f"{type(exc).__name__}: {exc}",
+        )
+        _sync_capability_run_status(
+            job,
+            status="failed",
+            current_focus="Background job crashed.",
+            next_step="Inspect the crash trace and retry the capability run if needed.",
             blocker=f"{type(exc).__name__}: {exc}",
         )
         append_job_event(job_id, kind="error", message=f"{type(exc).__name__}: {exc}")
