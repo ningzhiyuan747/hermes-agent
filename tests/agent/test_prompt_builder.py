@@ -17,6 +17,7 @@ from agent.prompt_builder import (
     _strip_yaml_frontmatter,
     build_skills_system_prompt,
     build_nous_subscription_prompt,
+    build_tool_guidance_block,
     build_context_files_prompt,
     build_environment_hints,
     CONTEXT_FILE_MAX_CHARS,
@@ -26,6 +27,7 @@ from agent.prompt_builder import (
     OPENAI_MODEL_EXECUTION_GUIDANCE,
     MEMORY_GUIDANCE,
     SESSION_SEARCH_GUIDANCE,
+    TOOL_ROUTING_GUIDANCE,
     PLATFORM_HINTS,
     WSL_ENVIRONMENT_HINT,
 )
@@ -40,14 +42,25 @@ from hermes_cli.nous_subscription import NousFeatureState, NousSubscriptionFeatu
 class TestGuidanceConstants:
     def test_memory_guidance_discourages_task_logs(self):
         assert "durable facts" in MEMORY_GUIDANCE
-        assert "Do NOT save task progress" in MEMORY_GUIDANCE
+        assert "Do not save task logs" in MEMORY_GUIDANCE
         assert "session_search" in MEMORY_GUIDANCE
-        assert "like a diary" not in MEMORY_GUIDANCE
-        assert ">80%" not in MEMORY_GUIDANCE
 
     def test_session_search_guidance_is_simple_cross_session_recall(self):
-        assert "relevant cross-session context exists" in SESSION_SEARCH_GUIDANCE
-        assert "recent turns of the current session" not in SESSION_SEARCH_GUIDANCE
+        assert "session_search" in SESSION_SEARCH_GUIDANCE
+        assert "repeat" in SESSION_SEARCH_GUIDANCE
+
+    def test_tool_routing_guidance_prefers_small_relevant_bucket(self):
+        assert "smallest relevant" in TOOL_ROUTING_GUIDANCE or "file" in TOOL_ROUTING_GUIDANCE
+        assert "file" in TOOL_ROUTING_GUIDANCE
+        assert "browser" in TOOL_ROUTING_GUIDANCE
+
+    def test_build_tool_guidance_block_is_compact_and_conditional(self):
+        block = build_tool_guidance_block({"memory", "session_search", "skill_manage"})
+        assert block.startswith("# Working rules")
+        assert "- memory:" in block
+        assert "- recall:" in block
+        assert "- skills:" in block
+        assert "- routing:" in block
 
 
 # =========================================================================
@@ -263,8 +276,8 @@ class TestBuildSkillsSystemPrompt:
         )
         result = build_skills_system_prompt()
         assert "python-debug" in result
-        assert "Debug Python scripts" in result
-        assert "available_skills" in result
+        assert "Do not preload lots of skills by default" in result
+        assert "available_skills_compact" in result
 
     def test_deduplicates_skills(self, monkeypatch, tmp_path):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -274,8 +287,8 @@ class TestBuildSkillsSystemPrompt:
             d.mkdir(parents=True, exist_ok=True)
             (d / "SKILL.md").write_text("---\ndescription: Search stuff\n---\n")
         result = build_skills_system_prompt()
-        # "search" should appear only once per category
-        assert result.count("- search") == 1
+        # compact index should mention the skill only once
+        assert result.count("search") == 1
 
     def test_excludes_incompatible_platform_skills(self, monkeypatch, tmp_path):
         """Skills with platforms: [macos] should not appear on Linux."""
@@ -323,7 +336,7 @@ class TestBuildSkillsSystemPrompt:
             result = build_skills_system_prompt()
 
         assert "imessage" in result
-        assert "Send iMessages" in result
+        assert "available_skills_compact" in result
 
     def test_excludes_disabled_skills(self, monkeypatch, tmp_path):
         """Skills in the user's disabled list should not appear in the system prompt."""

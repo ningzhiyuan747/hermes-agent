@@ -133,11 +133,26 @@ def _build_skill_message(
     activation_note: str,
     user_instruction: str = "",
     runtime_note: str = "",
+    compact: bool = False,
 ) -> str:
     """Format a loaded skill into a user/system message payload."""
     from tools.skills_tool import SKILLS_DIR
 
     content = str(loaded_skill.get("content") or "")
+    skill_name = str(loaded_skill.get("name") or (skill_dir.name if skill_dir else "skill"))
+    description = str(loaded_skill.get("description") or "").strip()
+
+    if compact:
+        parts = [activation_note, "", "[Skill card]"]
+        parts.append(f"- name: {skill_name}")
+        parts.append(f"- summary: {description or '(no description provided)'}")
+        parts.append("- mode: compact auto-load; read full instructions only if needed")
+        parts.append(f"- full: skill_view(name=\"{skill_name}\")")
+        if user_instruction:
+            parts.append(f"- user_instruction: {user_instruction}")
+        if runtime_note:
+            parts.append(f"- runtime_note: {runtime_note}")
+        return "\n".join(parts)
 
     parts = [activation_note, "", content.strip()]
 

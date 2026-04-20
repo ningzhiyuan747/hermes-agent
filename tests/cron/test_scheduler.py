@@ -64,6 +64,19 @@ class TestResolveDeliveryTarget:
             "thread_id": "17585",
         }
 
+    def test_origin_delivery_without_origin_falls_back_to_feishu_home_channel(self, monkeypatch):
+        monkeypatch.setenv("FEISHU_HOME_CHANNEL", "oc_home_feishu")
+        job = {
+            "deliver": "origin",
+            "origin": None,
+        }
+
+        assert _resolve_delivery_target(job) == {
+            "platform": "feishu",
+            "chat_id": "oc_home_feishu",
+            "thread_id": None,
+        }
+
     def test_explicit_telegram_topic_target_with_thread_id(self):
         """deliver: 'telegram:chat_id:thread_id' parses correctly."""
         job = {

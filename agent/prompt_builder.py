@@ -132,42 +132,24 @@ def _strip_yaml_frontmatter(content: str) -> str:
 # =========================================================================
 
 DEFAULT_AGENT_IDENTITY = (
-    "You are Hermes Agent, an intelligent AI assistant created by Nous Research. "
-    "You are helpful, knowledgeable, and direct. You assist users with a wide "
-    "range of tasks including answering questions, writing and editing code, "
-    "analyzing information, creative work, and executing actions via your tools. "
-    "You communicate clearly, admit uncertainty when appropriate, and prioritize "
-    "being genuinely useful over being verbose unless otherwise directed below. "
-    "Be targeted and efficient in your exploration and investigations."
+    "You are Hermes Agent by Nous Research: helpful, direct, grounded, and proactive with tools."
 )
 
 MEMORY_GUIDANCE = (
-    "You have persistent memory across sessions. Save durable facts using the memory "
-    "tool: user preferences, environment details, tool quirks, and stable conventions. "
-    "Memory is injected into every turn, so keep it compact and focused on facts that "
-    "will still matter later.\n"
-    "Prioritize what reduces future user steering — the most valuable memory is one "
-    "that prevents the user from having to correct or remind you again. "
-    "User preferences and recurring corrections matter more than procedural task details.\n"
-    "Do NOT save task progress, session outcomes, completed-work logs, or temporary TODO "
-    "state to memory; use session_search to recall those from past transcripts. "
-    "If you've discovered a new way to do something, solved a problem that could be "
-    "necessary later, save it as a skill with the skill tool."
+    "Save only durable facts to memory: user preferences, environment details, and stable conventions. "
+    "Do not save task logs or temporary state; use session_search for past work."
 )
 
 SESSION_SEARCH_GUIDANCE = (
-    "When the user references something from a past conversation or you suspect "
-    "relevant cross-session context exists, use session_search to recall it before "
-    "asking them to repeat themselves."
+    "If past-session context may matter, use session_search before asking the user to repeat it."
 )
 
 SKILLS_GUIDANCE = (
-    "After completing a complex task (5+ tool calls), fixing a tricky error, "
-    "or discovering a non-trivial workflow, save the approach as a "
-    "skill with skill_manage so you can reuse it next time.\n"
-    "When using a skill and finding it outdated, incomplete, or wrong, "
-    "patch it immediately with skill_manage(action='patch') — don't wait to be asked. "
-    "Skills that aren't maintained become liabilities."
+    "Load only relevant skills. After difficult or repeated work, save the proven workflow as a skill, and patch stale skills immediately."
+)
+
+TOOL_ROUTING_GUIDANCE = (
+    "Route by smallest relevant bucket first: file, terminal, web, browser, skills, memory, messaging, scheduling. Expand only when needed for completion or verification."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
@@ -196,71 +178,18 @@ TOOL_USE_ENFORCEMENT_MODELS = ("gpt", "codex", "gemini", "gemma", "grok")
 OPENAI_MODEL_EXECUTION_GUIDANCE = (
     "# Execution discipline\n"
     "<tool_persistence>\n"
-    "- Use tools whenever they improve correctness, completeness, or grounding.\n"
-    "- Do not stop early when another tool call would materially improve the result.\n"
-    "- If a tool returns empty or partial results, retry with a different query or "
-    "strategy before giving up.\n"
-    "- Keep calling tools until: (1) the task is complete, AND (2) you have verified "
-    "the result.\n"
-    "- If the user asked you to do something and you have the tools to attempt it, "
-    "attempt at least one concrete action before saying you cannot do it.\n"
+    "- Use tools when they improve correctness; keep going until the task is complete and verified, and retry once with a better query or method when results are partial.\n"
     "</tool_persistence>\n"
-    "\n"
-    "<mandatory_tool_use>\n"
-    "NEVER answer these from memory or mental computation — ALWAYS use a tool:\n"
-    "- Arithmetic, math, calculations → use terminal or execute_code\n"
-    "- Hashes, encodings, checksums → use terminal (e.g. sha256sum, base64)\n"
-    "- Current time, date, timezone → use terminal (e.g. date)\n"
-    "- System state: OS, CPU, memory, disk, ports, processes → use terminal\n"
-    "- File contents, sizes, line counts → use read_file, search_files, or terminal\n"
-    "- Git history, branches, diffs → use terminal\n"
-    "- Current facts (weather, news, versions) → use web_search\n"
-    "Your memory and user profile describe the USER, not the system you are "
-    "running on. The execution environment may differ from what the user profile "
-    "says about their personal setup.\n"
-    "</mandatory_tool_use>\n"
-    "\n"
-    "<act_dont_ask>\n"
-    "When a question has an obvious default interpretation, act on it immediately "
-    "instead of asking for clarification. Examples:\n"
-    "- 'Is port 443 open?' → check THIS machine (don't ask 'open where?')\n"
-    "- 'What OS am I running?' → check the live system (don't use user profile)\n"
-    "- 'What time is it?' → run `date` (don't guess)\n"
-    "Only ask for clarification when the ambiguity genuinely changes what tool "
-    "you would call.\n"
-    "</act_dont_ask>\n"
-    "\n"
     "<prerequisite_checks>\n"
-    "- Before taking an action, check whether prerequisite discovery, lookup, or "
-    "context-gathering steps are needed.\n"
-    "- Do not skip prerequisite steps just because the final action seems obvious.\n"
-    "- If a task depends on output from a prior step, resolve that dependency first.\n"
+    "- Do prerequisite or dependency checks before edits or claims.\n"
     "</prerequisite_checks>\n"
-    "\n"
     "<verification>\n"
-    "Before finalizing your response:\n"
-    "- Correctness: does the output satisfy every stated requirement?\n"
-    "- Grounding: are factual claims backed by tool outputs or provided context?\n"
-    "- Formatting: does the output match the requested format or schema?\n"
-    "- Safety: if the next step has side effects (file writes, commands, API calls), "
-    "confirm scope before executing.\n"
-    "- Never claim a task is completed, sent, opened, modified, deleted, or verified "
-    "unless this turn produced concrete evidence such as tool output, a file path, "
-    "a URL, a screenshot, or another inspectable artifact.\n"
-    "- If you only analyzed, drafted, or prepared a plan, say so explicitly instead "
-    "of phrasing it as already executed.\n"
-    "- When you report executed work, end with two explicit sections: 'Execution result:' "
-    "and 'Evidence:'. Under 'Evidence:', list the concrete artifacts that prove the action happened.\n"
-    "- If you claim you sent something, include a receipt, message ID, request ID, or callback ID under 'Evidence:', and it must come from the actual tool/platform response rather than being invented.\n"
-    "- If you claim you took a screenshot, include the image file path or image URL under 'Evidence:'.\n"
+    "- Never claim something was sent, changed, deleted, verified, or completed without concrete tool evidence.\n"
     "</verification>\n"
-    "\n"
     "<missing_context>\n"
-    "- If required context is missing, do NOT guess or hallucinate an answer.\n"
-    "- Use the appropriate lookup tool when missing information is retrievable "
-    "(search_files, web_search, read_file, etc.).\n"
-    "- Ask a clarifying question only when the information cannot be retrieved by tools.\n"
-    "- If you must proceed with incomplete information, label assumptions explicitly.\n"
+    "- Do arithmetic, hashes, time, system state, files, git, and current facts with tools, not memory.\n"
+    "- Act on obvious defaults; ask only when ambiguity changes the required tool.\n"
+    "- If missing context exists, retrieve it with tools first; do not guess or hallucinate, and otherwise state assumptions explicitly.\n"
     "</missing_context>"
 )
 
@@ -268,22 +197,11 @@ OPENAI_MODEL_EXECUTION_GUIDANCE = (
 # Injected alongside TOOL_USE_ENFORCEMENT_GUIDANCE when the model is Gemini or Gemma.
 GOOGLE_MODEL_OPERATIONAL_GUIDANCE = (
     "# Google model operational directives\n"
-    "Follow these operational rules strictly:\n"
-    "- **Absolute paths:** Always construct and use absolute file paths for all "
-    "file system operations. Combine the project root with relative paths.\n"
-    "- **Verify first:** Use read_file/search_files to check file contents and "
-    "project structure before making changes. Never guess at file contents.\n"
-    "- **Dependency checks:** Never assume a library is available. Check "
-    "package.json, requirements.txt, Cargo.toml, etc. before importing.\n"
-    "- **Conciseness:** Keep explanatory text brief — a few sentences, not "
-    "paragraphs. Focus on actions and results over narration.\n"
-    "- **Parallel tool calls:** When you need to perform multiple independent "
-    "operations (e.g. reading several files), make all the tool calls in a "
-    "single response rather than sequentially.\n"
-    "- **Non-interactive commands:** Use flags like -y, --yes, --non-interactive "
-    "to prevent CLI tools from hanging on prompts.\n"
-    "- **Keep going:** Work autonomously until the task is fully resolved. "
-    "Don't stop with a plan — execute it.\n"
+    "- Prefer absolute paths and verify files before editing.\n"
+    "- Check dependencies before importing or changing code.\n"
+    "- Keep explanations brief and action-focused.\n"
+    "- Use parallel tool calls when reads are independent.\n"
+    "- Prefer non-interactive CLI flags and keep going until the task is resolved."
 )
 
 # Model name substrings that should use the 'developer' role instead of
@@ -541,6 +459,10 @@ def _build_snapshot_entry(
 # Skills index
 # =========================================================================
 
+SKILLS_PROMPT_MAX_CATEGORIES = 8
+SKILLS_PROMPT_MAX_SKILLS_PER_CATEGORY = 3
+SKILLS_PROMPT_MAX_TOTAL_SKILLS = 24
+
 def _parse_skill_file(skill_file: Path) -> tuple[bool, dict, str]:
     """Read a SKILL.md once and return platform compatibility, frontmatter, and description.
 
@@ -767,44 +689,60 @@ def build_skills_system_prompt(
     if not skills_by_category:
         result = ""
     else:
-        index_lines = []
+        total_skills = 0
+        compact_lines = []
+        category_count = 0
+
         for category in sorted(skills_by_category.keys()):
-            cat_desc = category_descriptions.get(category, "")
-            if cat_desc:
-                index_lines.append(f"  {category}: {cat_desc}")
-            else:
-                index_lines.append(f"  {category}:")
-            # Deduplicate and sort skills within each category
+            if category_count >= SKILLS_PROMPT_MAX_CATEGORIES:
+                remaining_categories = len(skills_by_category) - category_count
+                compact_lines.append(
+                    f"  - ... {remaining_categories} more categories available via skills_list()"
+                )
+                break
+
             seen = set()
+            unique_skills = []
             for name, desc in sorted(skills_by_category[category], key=lambda x: x[0]):
                 if name in seen:
                     continue
                 seen.add(name)
-                if desc:
-                    index_lines.append(f"    - {name}: {desc}")
-                else:
-                    index_lines.append(f"    - {name}")
+                unique_skills.append((name, desc))
+
+            if not unique_skills:
+                continue
+
+            total_skills += len(unique_skills)
+            category_count += 1
+            shown = unique_skills[:SKILLS_PROMPT_MAX_SKILLS_PER_CATEGORY]
+            shown_names = ", ".join(name for name, _ in shown)
+            remainder = len(unique_skills) - len(shown)
+            suffix = f" (+{remainder} more)" if remainder > 0 else ""
+            cat_desc = category_descriptions.get(category, "")
+            if cat_desc:
+                compact_lines.append(
+                    f"  - {category}: {cat_desc} | examples: {shown_names}{suffix}"
+                )
+            else:
+                compact_lines.append(
+                    f"  - {category}: examples: {shown_names}{suffix}"
+                )
+
+        compact_lines.append(
+            f"  - total visible skills matching this runtime: {min(total_skills, SKILLS_PROMPT_MAX_TOTAL_SKILLS)}"
+            + (f"+ (truncated from {total_skills})" if total_skills > SKILLS_PROMPT_MAX_TOTAL_SKILLS else "")
+        )
 
         result = (
             "## Skills (mandatory)\n"
-            "Before replying, scan the skills below. If a skill matches or is even partially relevant "
-            "to your task, you MUST load it with skill_view(name) and follow its instructions. "
-            "Err on the side of loading — it is always better to have context you don't need "
-            "than to miss critical steps, pitfalls, or established workflows. "
-            "Skills contain specialized knowledge — API endpoints, tool-specific commands, "
-            "and proven workflows that outperform general-purpose approaches. Load the skill "
-            "even if you think you could handle the task with basic tools like web_search or terminal. "
-            "Skills also encode the user's preferred approach, conventions, and quality standards "
-            "for tasks like code review, planning, and testing — load them even for tasks you "
-            "already know how to do, because the skill defines how it should be done here.\n"
-            "If a skill has issues, fix it with skill_manage(action='patch').\n"
-            "After difficult/iterative tasks, offer to save as a skill. "
-            "If a skill you loaded was missing steps, had wrong commands, or needed "
-            "pitfalls you discovered, update it before finishing.\n"
+            "Do not preload lots of skills by default. First infer the task type, then load only the most relevant skill(s) with skill_view(name).\n"
+            "Use skills_list() when you need the full catalog; the index below is intentionally compact.\n"
+            "If a loaded skill is stale or wrong, fix it with skill_manage(action='patch').\n"
+            "After difficult or repeated work, save the proven workflow as a skill.\n"
             "\n"
-            "<available_skills>\n"
-            + "\n".join(index_lines) + "\n"
-            "</available_skills>\n"
+            "<available_skills_compact>\n"
+            + "\n".join(compact_lines) + "\n"
+            "</available_skills_compact>\n"
             "\n"
             "Only proceed without loading a skill if genuinely none are relevant to the task."
         )
@@ -817,6 +755,23 @@ def build_skills_system_prompt(
             _SKILLS_PROMPT_CACHE.popitem(last=False)
 
     return result
+
+
+def build_tool_guidance_block(valid_tool_names: "set[str] | None" = None) -> str:
+    """Build a compact task/tool guidance block for the system prompt."""
+    tool_names = set(valid_tool_names or set())
+    lines: list[str] = []
+    if "memory" in tool_names:
+        lines.append(f"- memory: {MEMORY_GUIDANCE}")
+    if "session_search" in tool_names:
+        lines.append(f"- recall: {SESSION_SEARCH_GUIDANCE}")
+    if any(name in tool_names for name in {"skills_list", "skill_view", "skill_manage"}):
+        lines.append(f"- skills: {SKILLS_GUIDANCE}")
+    if tool_names:
+        lines.append(f"- routing: {TOOL_ROUTING_GUIDANCE}")
+    if not lines:
+        return ""
+    return "# Working rules\n" + "\n".join(lines)
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:

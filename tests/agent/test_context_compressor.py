@@ -242,6 +242,45 @@ class TestSummaryFailureCooldown:
         assert mock_call.call_count == 1
 
 
+class TestSummaryCompactionRegression:
+    def test_serialize_for_summary_skips_prior_compaction_messages(self):
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+
+        turns = [
+            {"role": "user", "content": "fresh request"},
+            {"role": "assistant", "content": f"{SUMMARY_PREFIX}\nold summary body"},
+            {"role": "assistant", "content": "new progress"},
+        ]
+
+        serialized = c._serialize_for_summary(turns)
+        assert "old summary body" not in serialized
+        assert "fresh request" in serialized
+        assert "new progress" in serialized
+
+    def test_generate_summary_does_not_inline_previous_summary(self):
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "## Active Task\nkeep going"
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(model="test", quiet_mode=True)
+        c._previous_summary = "old summary that should not be re-injected"
+
+        messages = [
+            {"role": "user", "content": "new work only"},
+            {"role": "assistant", "content": "latest progress"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", return_value=mock_response) as mock_call:
+            c._generate_summary(messages)
+
+        prompt = mock_call.call_args.kwargs["messages"][0]["content"]
+        assert "PREVIOUS SUMMARY:" not in prompt
+        assert "old summary that should not be re-injected" not in prompt
+        assert "new work only" in prompt
+
+
 class TestSummaryPrefixNormalization:
     def test_legacy_prefix_is_replaced(self):
         summary = ContextCompressor._with_summary_prefix("[CONTEXT SUMMARY]: did work")

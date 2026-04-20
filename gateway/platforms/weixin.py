@@ -1178,6 +1178,35 @@ class WeixinAdapter(BasePlatformAdapter):
             item_types=",".join(item_types) if item_types else "-",
         )
 
+    def _create_http_session(self) -> "aiohttp.ClientSession":
+        return aiohttp.ClientSession(trust_env=True)
+
+    async def _close_http_session(self, session: Optional["aiohttp.ClientSession"]) -> None:
+        if session and not session.closed:
+            await session.close()
+
+    def _is_recoverable_transport_error(self, exc: Exception) -> bool:
+        if isinstance(exc, (asyncio.TimeoutError, ConnectionError, OSError)):
+            return True
+        aiohttp_client_error = getattr(aiohttp, "ClientError", None)
+        return bool(aiohttp_client_error and isinstance(exc, aiohttp_client_error))
+
+    async def _refresh_http_session(self, *, reason: str) -> bool:
+        old_session = self._session
+        try:
+            self._session = self._create_http_session()
+        except Exception as exc:
+            logger.warning("[%s] failed to recreate HTTP session after %s: %s", self.name, reason, exc)
+            self._session = old_session
+            return False
+
+        try:
+            await self._close_http_session(old_session)
+        except Exception as exc:
+            logger.debug("[%s] failed closing stale HTTP session after %s: %s", self.name, reason, exc)
+        logger.info("[%s] recreated HTTP session after %s", self.name, reason)
+        return True
+
     async def connect(self) -> bool:
         if not check_weixin_requirements():
             message = "Weixin startup failed: aiohttp and cryptography are required"
@@ -1201,7 +1230,7 @@ class WeixinAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.debug("[%s] Token lock unavailable (non-fatal): %s", self.name, exc)
 
-        self._session = aiohttp.ClientSession(trust_env=True)
+        self._session = self._create_http_session()
         self._token_store.restore(self._account_id)
         self._poll_task = asyncio.create_task(self._poll_loop(), name="weixin-poll")
         self._mark_connected()
@@ -1217,8 +1246,7 @@ class WeixinAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
-        if self._session and not self._session.closed:
-            await self._session.close()
+        await self._close_http_session(self._session)
         self._session = None
         self._release_platform_lock()
         self._mark_disconnected()
@@ -1282,6 +1310,11 @@ class WeixinAdapter(BasePlatformAdapter):
             except Exception as exc:
                 consecutive_failures += 1
                 logger.error("[%s] poll error (%d/%d): %s", self.name, consecutive_failures, MAX_CONSECUTIVE_FAILURES, exc)
+                if (
+                    consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+                    and self._is_recoverable_transport_error(exc)
+                ):
+                    await self._refresh_http_session(reason=f"{consecutive_failures} consecutive poll failures")
                 await asyncio.sleep(BACKOFF_DELAY_SECONDS if consecutive_failures >= MAX_CONSECUTIVE_FAILURES else RETRY_DELAY_SECONDS)
                 if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
                     consecutive_failures = 0
@@ -1520,6 +1553,8 @@ class WeixinAdapter(BasePlatformAdapter):
                 last_error = exc
                 if attempt >= self._send_chunk_retries:
                     break
+                if self._is_recoverable_transport_error(exc):
+                    await self._refresh_http_session(reason=f"send failure to {_safe_id(chat_id)}")
                 wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
                 logger.warning(
                     "[%s] send chunk failed to=%s attempt=%d/%d, retrying in %.2fs: %s",

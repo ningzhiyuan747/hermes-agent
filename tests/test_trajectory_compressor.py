@@ -40,7 +40,7 @@ class TestCompressionConfig:
     def test_defaults(self):
         config = CompressionConfig()
         assert config.target_max_tokens == 15250
-        assert config.summary_target_tokens == 750
+        assert config.summary_target_tokens == 400
         assert config.protect_last_n_turns == 4
         assert config.skip_under_target is True
 

@@ -81,8 +81,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    MEMORY_GUIDANCE, SESSION_SEARCH_GUIDANCE, SKILLS_GUIDANCE,
-    build_nous_subscription_prompt,
+    build_tool_guidance_block, build_nous_subscription_prompt,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -3376,16 +3375,9 @@ class AIAgent:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
 
-        # Tool-aware behavioral guidance: only inject when the tools are loaded
-        tool_guidance = []
-        if "memory" in self.valid_tool_names:
-            tool_guidance.append(MEMORY_GUIDANCE)
-        if "session_search" in self.valid_tool_names:
-            tool_guidance.append(SESSION_SEARCH_GUIDANCE)
-        if "skill_manage" in self.valid_tool_names:
-            tool_guidance.append(SKILLS_GUIDANCE)
+        tool_guidance = build_tool_guidance_block(self.valid_tool_names)
         if tool_guidance:
-            prompt_parts.append(" ".join(tool_guidance))
+            prompt_parts.append(tool_guidance)
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:
@@ -3490,14 +3482,14 @@ class AIAgent:
 
         from hermes_time import now as _hermes_now
         now = _hermes_now()
-        timestamp_line = f"Conversation started: {now.strftime('%A, %B %d, %Y %I:%M %p')}"
+        runtime_bits = [f"Conversation started: {now.strftime('%Y-%m-%d %H:%M')}" ]
         if self.pass_session_id and self.session_id:
-            timestamp_line += f"\nSession ID: {self.session_id}"
+            runtime_bits.append(f"session={self.session_id}")
         if self.model:
-            timestamp_line += f"\nModel: {self.model}"
+            runtime_bits.append(f"model={self.model}")
         if self.provider:
-            timestamp_line += f"\nProvider: {self.provider}"
-        prompt_parts.append(timestamp_line)
+            runtime_bits.append(f"provider={self.provider}")
+        prompt_parts.append("Runtime: " + " | ".join(runtime_bits))
 
         # Alibaba Coding Plan API always returns "glm-4.7" as model name regardless
         # of the requested model. Inject explicit model identity into the system prompt

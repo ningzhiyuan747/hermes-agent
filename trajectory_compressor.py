@@ -63,7 +63,7 @@ class CompressionConfig:
     
     # Compression targets
     target_max_tokens: int = 15250
-    summary_target_tokens: int = 750
+    summary_target_tokens: int = 400
     
     # Protected turns
     protect_first_system: bool = True

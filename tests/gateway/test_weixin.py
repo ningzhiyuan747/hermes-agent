@@ -24,7 +24,13 @@ def _make_adapter() -> WeixinAdapter:
         PlatformConfig(
             enabled=True,
             token="test-token",
-            extra={"account_id": "test-account"},
+            extra={
+                "account_id": "test-account",
+                "dm_policy": "open",
+                "allow_from": [],
+                "group_policy": "disabled",
+                "group_allow_from": [],
+            },
         )
     )
 
@@ -426,6 +432,62 @@ class TestWeixinChunkDelivery:
         retry = send_message_mock.await_args_list[2].kwargs
         assert first_try["text"] == retry["text"]
         assert first_try["client_id"] == retry["client_id"]
+
+    @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_send_recreates_http_session_after_transient_network_error(self, send_message_mock, sleep_mock):
+        adapter = self._connected_adapter()
+        first_session = object()
+        second_session = object()
+        adapter._session = first_session
+        adapter._create_http_session = lambda: second_session
+        adapter._close_http_session = AsyncMock()
+        adapter._is_recoverable_transport_error = lambda exc: True
+
+        calls = {"count": 0}
+
+        async def flaky_send(session, **kwargs):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("temporary iLink failure")
+            assert session is second_session
+
+        send_message_mock.side_effect = flaky_send
+
+        result = asyncio.run(adapter.send("wxid_test123", "hello"))
+
+        assert result.success is True
+        adapter._close_http_session.assert_awaited_once_with(first_session)
+        assert adapter._session is second_session
+
+    @pytest.mark.asyncio
+    async def test_poll_loop_recreates_http_session_after_repeated_transport_failures(self):
+        adapter = self._connected_adapter()
+        first_session = object()
+        second_session = object()
+        adapter._session = first_session
+        adapter._running = True
+        adapter._create_http_session = lambda: second_session
+        adapter._close_http_session = AsyncMock()
+        adapter._is_recoverable_transport_error = lambda exc: True
+
+        attempts = {"count": 0}
+
+        async def fake_get_updates(session, **kwargs):
+            attempts["count"] += 1
+            if attempts["count"] <= weixin.MAX_CONSECUTIVE_FAILURES:
+                raise RuntimeError("poll transport failure")
+            adapter._running = False
+            assert session is second_session
+            return {"ret": 0, "msgs": [], "get_updates_buf": "buf-2"}
+
+        with patch("gateway.platforms.weixin._get_updates", side_effect=fake_get_updates), \
+             patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock) as sleep_mock:
+            await adapter._poll_loop()
+
+        adapter._close_http_session.assert_awaited_once_with(first_session)
+        assert adapter._session is second_session
+        assert sleep_mock.await_count >= weixin.MAX_CONSECUTIVE_FAILURES
 
 
 class TestWeixinRemoteMediaSafety:

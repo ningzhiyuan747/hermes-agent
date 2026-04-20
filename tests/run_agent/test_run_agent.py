@@ -652,21 +652,17 @@ class TestBuildSystemPrompt:
         assert "Custom instruction" in prompt
 
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
-        from agent.prompt_builder import MEMORY_GUIDANCE
-
         prompt = agent_with_memory_tool._build_system_prompt()
-        assert MEMORY_GUIDANCE in prompt
+        assert "# Working rules" in prompt
+        assert "- memory:" in prompt
 
     def test_no_memory_guidance_without_tool(self, agent):
-        from agent.prompt_builder import MEMORY_GUIDANCE
-
         prompt = agent._build_system_prompt()
-        assert MEMORY_GUIDANCE not in prompt
+        assert "- memory:" not in prompt
 
     def test_includes_datetime(self, agent):
         prompt = agent._build_system_prompt()
-        # Should contain current date info like "Conversation started:"
-        assert "Conversation started:" in prompt
+        assert "Runtime: Conversation started:" in prompt
 
     def test_includes_nous_subscription_prompt(self, agent, monkeypatch):
         monkeypatch.setattr(run_agent, "build_nous_subscription_prompt", lambda tool_names: "NOUS SUBSCRIPTION BLOCK")
