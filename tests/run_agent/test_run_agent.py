@@ -654,7 +654,45 @@ class TestBuildSystemPrompt:
     def test_memory_guidance_when_memory_tool_loaded(self, agent_with_memory_tool):
         prompt = agent_with_memory_tool._build_system_prompt()
         assert "# Working rules" in prompt
+        assert "- tool-surface:" in prompt
+        assert "memory" in prompt
         assert "- memory:" in prompt
+
+    def test_continuity_guidance_when_file_tools_loaded(self):
+        tools = _make_tool_defs("read_file", "write_file")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = agent._build_system_prompt()
+
+        assert "- continuity:" in prompt
+        assert "persistent work products" in prompt
+
+    def test_runtime_tool_surface_guidance_lists_live_capabilities(self):
+        tools = _make_tool_defs("read_file", "terminal", "browser_navigate", "send_message", "cronjob")
+        with (
+            patch("run_agent.get_tool_definitions", return_value=tools),
+            patch("run_agent.check_toolset_requirements", return_value={}),
+            patch("run_agent.OpenAI"),
+        ):
+            agent = AIAgent(
+                api_key="test-key-1234567890",
+                quiet_mode=True,
+                skip_context_files=True,
+                skip_memory=True,
+            )
+            prompt = agent._build_system_prompt()
+
+        assert "available capabilities in this session = file, terminal, browser, messaging, scheduling" in prompt
+        assert "Prefer these live tools over guessing about unavailable ones." in prompt
 
     def test_no_memory_guidance_without_tool(self, agent):
         prompt = agent._build_system_prompt()

@@ -43,6 +43,7 @@ def test_build_session_memory_scope_prompt_for_dm_uses_user_memory(monkeypatch):
     text = scope.build_session_memory_scope_prompt()
 
     assert "Current external identity in this conversation" in text
+    assert "Stable repo/workspace/tool facts belong to system memory" in text
     assert "This is a private user conversation" in text
     assert "Distilled working profile summary: 偏好先给结论、输出尽量短、默认中文" in text
     assert "Distilled core principles: 先给结论；默认中文沟通" in text
@@ -76,6 +77,7 @@ def test_build_session_memory_scope_prompt_for_task_group_uses_task_memory(monke
 
     assert "This conversation is bound to task task-123 (中标合同取证)." in text
     assert "Use task memory as the shared durable context for this conversation." in text
+    assert "There is no separate durable channel memory layer here" in text
     assert "Task memory summary: 已确认采购单位，下一步追合同附件" in text
     assert "Do not expose or rely on any participant's private DM memory here" in text
 
@@ -95,4 +97,5 @@ def test_build_session_memory_scope_prompt_for_unbound_group_blocks_private_memo
     text = scope.build_session_memory_scope_prompt()
 
     assert "This is a shared chat without a bound task." in text
+    assert "There is no durable shared channel memory here until a task is bound." in text
     assert "Do not use any participant's private memory as shared context here." in text

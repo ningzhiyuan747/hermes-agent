@@ -127,7 +127,32 @@ _WEIXIN_DIRECT_COMMAND_ALIASES = {
     "状态": "/status",
     "进度": "/status",
     "status": "/status",
+    "任务板": "/task-board",
+    "任务看板": "/task-board",
+    "统一任务板": "/task-board",
+    "控制塔": "/control-tower",
+    "塔台": "/control-tower",
+    "秘书": "/secretary-loop",
+    "秘书动作": "/secretary-loop",
+    "operator": "/operator-worklist",
+    "操作队列": "/operator-worklist",
+    "后台任务": "/job-status",
+    "后台任务状态": "/job-status",
+    "活跃任务": "/active-tasks",
+    "待批准": "/pending-approvals",
+    "待审批": "/pending-approvals",
+    "卡住的": "/blocked-tasks",
+    "阻塞任务": "/blocked-tasks",
+    "最近失败": "/recent-failures",
+    "失败任务": "/recent-failures",
 }
+_WEIXIN_PREFIX_COMMAND_ALIASES = (
+    ("重投递", "/retry-delivery"),
+    ("重新投递", "/retry-delivery"),
+    ("催继续", "/follow-up"),
+    ("催一下", "/follow-up"),
+    ("提醒一下", "/follow-up"),
+)
 
 
 def check_weixin_requirements() -> bool:
@@ -145,6 +170,14 @@ def normalize_weixin_gateway_command_text(text: Optional[str]) -> str:
     raw = str(text or "").strip()
     if not raw or raw.startswith("/"):
         return raw
+
+    for prefix, command in _WEIXIN_PREFIX_COMMAND_ALIASES:
+        if raw == prefix:
+            return command
+        if raw.startswith(prefix):
+            suffix = raw[len(prefix):].strip()
+            if suffix:
+                return f"{command} {suffix}"
 
     compact = _WEIXIN_COMMAND_SEPARATORS_RE.sub("", raw).lower()
     if not compact:

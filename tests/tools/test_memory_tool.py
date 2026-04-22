@@ -8,6 +8,7 @@ from tools.memory_tool import (
     MemoryStore,
     memory_tool,
     _scan_memory_content,
+    _scan_system_memory_content,
     ENTRY_DELIMITER,
     MEMORY_SCHEMA,
 )
@@ -25,6 +26,7 @@ class TestMemorySchema:
         assert "like a diary" not in description
         assert "temporary task state" in description
         assert ">80%" not in description
+        assert "'system'" in description
 
 
 # =========================================================================
@@ -85,6 +87,21 @@ class TestScanMemoryContent:
         assert "sys_prompt_override" in result
 
 
+class TestScanSystemMemoryContent:
+    def test_shared_system_fact_passes(self):
+        assert _scan_system_memory_content("Canonical workspace path is F:\\hermes-dingtalk-bridge") is None
+
+    def test_person_preference_blocked(self):
+        result = _scan_system_memory_content("用户偏好先给结论")
+        assert "Blocked" in result
+        assert "person_preference" in result or "person_preference_cn" in result
+
+    def test_task_state_blocked(self):
+        result = _scan_system_memory_content("下一步是修飞书鉴权")
+        assert "Blocked" in result
+        assert "task_state" in result or "task_state_cn" in result
+
+
 # =========================================================================
 # MemoryStore core operations
 # =========================================================================
@@ -108,6 +125,21 @@ class TestMemoryStoreAdd:
         result = store.add("user", "Name: Alice")
         assert result["success"] is True
         assert result["target"] == "user"
+
+    def test_add_to_system_alias(self, store):
+        result = store.add("system", "Workspace canonical path is F:\\hermes-dingtalk-bridge")
+        assert result["success"] is True
+        assert "Workspace canonical path is F:\\hermes-dingtalk-bridge" in result["entries"]
+
+    def test_add_task_state_to_system_rejected(self, store):
+        result = store.add("system", "下一步是补 operator queue")
+        assert result["success"] is False
+        assert "system-memory exclusion" in result["error"]
+
+    def test_add_person_preference_to_system_rejected(self, store):
+        result = store.add("system", "用户偏好简洁回答")
+        assert result["success"] is False
+        assert "system-memory exclusion" in result["error"]
 
     def test_add_empty_rejected(self, store):
         result = store.add("memory", "  ")
@@ -197,6 +229,17 @@ class TestMemoryStorePersistence:
         assert "persistent fact" in store2.memory_entries
         assert "Alice, developer" in store2.user_entries
 
+    def test_system_target_persists_to_memory_file(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
+
+        store = MemoryStore()
+        store.load_from_disk()
+        store.add("system", "Hermes gateway runs in WSL")
+
+        mem_file = tmp_path / "MEMORY.md"
+        assert mem_file.exists()
+        assert "Hermes gateway runs in WSL" in mem_file.read_text(encoding="utf-8")
+
     def test_deduplication_on_load(self, tmp_path, monkeypatch):
         monkeypatch.setattr("tools.memory_tool.get_memory_dir", lambda: tmp_path)
         # Write file with duplicates
@@ -239,6 +282,11 @@ class TestMemoryToolDispatcher:
     def test_invalid_target(self, store):
         result = json.loads(memory_tool(action="add", target="invalid", content="x", store=store))
         assert result["success"] is False
+
+    def test_system_target_is_valid(self, store):
+        result = json.loads(memory_tool(action="add", target="system", content="Use WSL for Hermes gateway", store=store))
+        assert result["success"] is True
+        assert result["target"] == "system"
 
     def test_unknown_action(self, store):
         result = json.loads(memory_tool(action="unknown", store=store))

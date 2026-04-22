@@ -81,7 +81,7 @@ from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY, PLATFORM_HINTS,
-    build_tool_guidance_block, build_nous_subscription_prompt,
+    build_tool_guidance_block, build_nous_subscription_prompt, build_collaboration_policy_block,
 )
 from agent.model_metadata import (
     fetch_model_metadata,
@@ -3378,6 +3378,10 @@ class AIAgent:
         tool_guidance = build_tool_guidance_block(self.valid_tool_names)
         if tool_guidance:
             prompt_parts.append(tool_guidance)
+
+        collaboration_policy = build_collaboration_policy_block()
+        if collaboration_policy:
+            prompt_parts.append(collaboration_policy)
 
         nous_subscription_prompt = build_nous_subscription_prompt(self.valid_tool_names)
         if nous_subscription_prompt:

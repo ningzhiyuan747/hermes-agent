@@ -59,15 +59,21 @@ def format_task_panel_snapshot(snapshot: Dict[str, Any], *, header: str = "当�
     task = snapshot.get("task") if isinstance(snapshot.get("task"), dict) else {}
     current_run = snapshot.get("current_run") if isinstance(snapshot.get("current_run"), dict) else {}
     current_job = snapshot.get("current_job") if isinstance(snapshot.get("current_job"), dict) else {}
+    current_delegation = snapshot.get("current_delegation") if isinstance(snapshot.get("current_delegation"), dict) else {}
     approvals = snapshot.get("approvals") if isinstance(snapshot.get("approvals"), list) else []
     artifact_items = snapshot.get("artifact_items") if isinstance(snapshot.get("artifact_items"), list) else []
+    control_summary = snapshot.get("control_summary") if isinstance(snapshot.get("control_summary"), dict) else {}
     lines = [header, f"Task ID: {str(task.get('task_id') or '').strip()}"]
     if str(task.get("title") or "").strip():
         lines.append(f"标题: {str(task.get('title') or '').strip()}")
-    if str(task.get("status") or "").strip():
-        lines.append(f"状态: {str(task.get('status') or '').strip()}")
+    summary_status = str(control_summary.get("status") or task.get("status") or "").strip()
+    if summary_status:
+        lines.append(f"状态: {summary_status}")
     if str(task.get("goal") or "").strip():
         lines.append(f"目标: {str(task.get('goal') or '').strip()}")
+    current_executor = str(control_summary.get("current_executor") or "").strip()
+    if current_executor:
+        lines.append(f"当前执行器: {current_executor}")
     if current_run:
         lines.append(
             f"当前 Run: {str(current_run.get('capability_name') or '-').strip()} / {str(current_run.get('status') or '-').strip()}"
@@ -76,13 +82,82 @@ def format_task_panel_snapshot(snapshot: Dict[str, Any], *, header: str = "当�
         lines.append(
             f"当前后台任务: {str(current_job.get('job_id') or '-').strip()} / {str(current_job.get('status') or '-').strip()}"
         )
+    if current_delegation:
+        lines.append(
+            f"当前子代理: {str(current_delegation.get('worker_role') or current_delegation.get('role_title') or '-').strip()} / {str(current_delegation.get('status') or '-').strip()}"
+        )
     if approvals:
         lines.append(f"待审批: {len(approvals)}")
-    for scope_payload in (current_run, current_job):
+    current_focus = str(control_summary.get("current_focus") or "").strip()
+    next_step = str(control_summary.get("next_step") or "").strip()
+    blocker = str(control_summary.get("blocker") or "").strip()
+    failure_kind = str(control_summary.get("failure_kind") or "").strip()
+    execution_status = str(control_summary.get("execution_status") or "").strip()
+    delivery_status = str(control_summary.get("delivery_status") or "").strip()
+    recovery_hint = str(control_summary.get("recovery_hint") or "").strip()
+    dispatch_action = str(control_summary.get("dispatch_action") or "").strip()
+    suggested_executor = str(control_summary.get("suggested_executor") or "").strip()
+    last_secretary_action = str(control_summary.get("last_secretary_action") or "").strip()
+    last_secretary_action_summary = str(control_summary.get("last_secretary_action_summary") or "").strip()
+    requested_executor_override = str(control_summary.get("requested_executor_override") or "").strip()
+    last_follow_up_summary = str(control_summary.get("last_follow_up_summary") or "").strip()
+    last_follow_up_target_ref = str(control_summary.get("last_follow_up_target_ref") or "").strip()
+    operator_queue_count = int(control_summary.get("operator_queue_count") or 0)
+    operator_queue_next = str(control_summary.get("operator_queue_next") or "").strip()
+    last_operator_resolution = str(control_summary.get("last_operator_resolution") or "").strip()
+    last_operator_resolution_summary = str(control_summary.get("last_operator_resolution_summary") or "").strip()
+    if current_focus:
+        lines.append(f"当前: {current_focus[:120]}")
+    if next_step:
+        lines.append(f"下一步: {next_step[:120]}")
+    if blocker:
+        lines.append(f"阻塞: {blocker[:120]}")
+    if execution_status:
+        lines.append(f"执行状态: {execution_status}")
+    if delivery_status:
+        lines.append(f"投递状态: {delivery_status}")
+    if failure_kind:
+        lines.append(f"失败分类: {failure_kind}")
+    if recovery_hint:
+        lines.append(f"恢复建议: {recovery_hint[:120]}")
+    if dispatch_action:
+        lines.append(f"调度动作: {dispatch_action}")
+    if suggested_executor:
+        lines.append(f"建议执行器: {suggested_executor}")
+    if last_secretary_action:
+        lines.append(f"最近秘书动作: {last_secretary_action}")
+    if requested_executor_override:
+        lines.append(f"秘书改派请求: {requested_executor_override}")
+    if last_secretary_action_summary:
+        lines.append(f"秘书动作结果: {last_secretary_action_summary[:120]}")
+    if last_follow_up_target_ref:
+        lines.append(f"最近秘书提醒目标: {last_follow_up_target_ref}")
+    if last_follow_up_summary:
+        lines.append(f"最近秘书提醒: {last_follow_up_summary[:120]}")
+    if operator_queue_count > 0:
+        lines.append(f"待处理操作: {operator_queue_count}")
+    if operator_queue_next:
+        lines.append(f"操作队列下一项: {operator_queue_next[:120]}")
+    if last_operator_resolution:
+        lines.append(f"最近操作结论: {last_operator_resolution}")
+    if last_operator_resolution_summary:
+        lines.append(f"操作结论摘要: {last_operator_resolution_summary[:120]}")
+    for scope_payload in (current_delegation, current_run, current_job):
         scope_lines = _scope_lines(scope_payload, fullwidth_colon=fullwidth_colon)
         if scope_lines:
             lines.extend(scope_lines)
             break
+    if not current_run and not current_job:
+        scope_lines = []
+        colon = "：" if fullwidth_colon else ":"
+        task_scope_key = str(control_summary.get("task_scope_key") or "").strip()
+        person_memory_key = str(control_summary.get("person_memory_key") or "").strip()
+        if task_scope_key:
+            scope_lines.append(f"Task scope{colon} {task_scope_key[:120]}")
+        if person_memory_key:
+            scope_lines.append(f"Person memory{colon} {person_memory_key[:120]}")
+        if scope_lines:
+            lines.extend(scope_lines)
     if artifact_items:
         lines.append("最近产物:")
         for artifact in sorted_artifact_items(artifact_items)[:3]:
@@ -131,7 +206,10 @@ def _scope_lines(payload: Dict[str, Any], *, fullwidth_colon: bool = False) -> L
         return []
     colon = "：" if fullwidth_colon else ":"
     lines: List[str] = []
-    if str(payload.get("job_id") or "").strip():
+    if str(payload.get("worker_role") or payload.get("role_title") or "").strip():
+        task_scope_key = str(payload.get("task_scope_key") or "").strip()
+        person_memory_key = str(payload.get("person_memory_key") or "").strip()
+    elif str(payload.get("job_id") or "").strip():
         task_scope_key = extract_background_job_task_scope_key(payload)
         person_memory_key = extract_background_job_person_memory_key(payload)
     else:

@@ -1,4 +1,5 @@
 from agent import business_db
+from gateway import session_context
 
 
 def test_upsert_user_distilled_profile_preserves_locked_fields(tmp_path, monkeypatch):
@@ -117,3 +118,40 @@ def test_distilled_profile_history_tracks_draft_publish_and_override(tmp_path, m
     assert history[1]["action"] == "draft_discarded"
     assert any(item["action"] == "published" for item in history)
     assert any(item["action"] == "draft_saved" for item in history)
+
+
+def test_distilled_profile_mutation_records_governance(tmp_path, monkeypatch):
+    db_file = tmp_path / "distilled-governance.sqlite3"
+    monkeypatch.setattr(business_db, "db_path", lambda: db_file)
+
+    business_db.upsert_user(platform="dingtalk", user_id="u-4", display_name="User 4")
+    business_db.save_user_distilled_profile_draft(
+        platform="dingtalk",
+        user_id="u-4",
+        summary="输出偏好：先结论。",
+        profile={"preferred_output": "先结论"},
+        updated_by="distiller",
+    )
+
+    tokens = session_context.set_session_vars(
+        platform="dingtalk",
+        chat_id="cid_dm_4",
+        chat_type="dm",
+        user_id="u-4",
+    )
+    try:
+        record = business_db.publish_user_distilled_profile_draft(
+            platform="dingtalk",
+            user_id="u-4",
+            published_by="u-4",
+            actor_user_id="u-4",
+        )
+    finally:
+        session_context.clear_session_vars(tokens)
+
+    governance = record["memory"]["governance"]
+    assert governance["last_action"] == "published"
+    assert governance["last_actor"] == "u-4"
+    assert governance["owner_ref"] == "dingtalk:user:u-4"
+    assert governance["cross_user_override"] is False
+    assert governance["write_context"]["chat_type"] == "dm"

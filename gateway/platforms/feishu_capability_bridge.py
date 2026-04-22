@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.capability_execution_policy import get_capability_execution_policy
+from agent.executor_registry import resolve_route_executor
 from agent.capability_status_service import (
     cancel_background_jobs as cancel_background_jobs_service,
     get_background_job_snapshot as get_background_job_snapshot_service,
@@ -49,6 +50,38 @@ _CODEX_ACTION_PATTERNS = (
     r"修", r"改", r"实现", r"开发", r"排查", r"debug", r"fix", r"edit", r"implement", r"review", r"run",
 )
 _CODEX_RESUME_PATTERNS = (r"继续", r"接着", r"恢复", r"上一条", r"上一个", r"上次", r"resume", r"continue", r"续上")
+
+
+_EXECUTION_TRUTHFULNESS_BRIEF = (
+    "Execution contract for this turn:\n"
+    "1. If the user asks you to do something that your tools can attempt, take at least one concrete action before saying you cannot do it.\n"
+    "2. Never claim an action is completed, sent, opened, modified, deleted, installed, or verified unless you have execution evidence in this run.\n"
+    "3. Valid evidence includes tool output, command output, callback result, screenshot, file path, URL, or other directly inspectable artifacts.\n"
+    "4. If you only analyzed, planned, drafted, or prepared something, say that explicitly; do not phrase it as already executed.\n"
+    "5. If you are blocked, name the exact blocker and the next unblock step instead of pretending the task is done.\n"
+    "6. If you report something as executed, include two explicit sections at the end: '执行结果:' and '证据:'.\n"
+    "7. In '证据:', include direct artifacts such as file paths, URLs, screenshots, command output summaries, or callback receipts.\n"
+    "8. Your final answer must match reality: executed tasks as executed, unverified work as unverified, blocked work as blocked.\n"
+)
+
+
+def build_executor_ownership_brief(route: Dict[str, str]) -> str:
+    executor = str(route.get("executor") or "hermes").strip().lower()
+    capability = str(route.get("capability") or "").strip() or "unknown"
+    if executor == "openclaw":
+        return (
+            f"当前层级：这是 capability={capability} 的 OpenClaw 执行切片，不是总控轮次。\n"
+            "你的职责是把明确范围内的事实查清、工具跑通、结果验证并结构化回包。\n"
+            "除非任务极简单，否则按以下结构输出：1. 结论 2. 关键发现 3. 证据与来源 4. 风险 / 缺口 5. 建议下一步。\n"
+            "不要接管长期项目控制、跨会话编排或统一用户接口决策。\n"
+            "如果任务演变成多阶段编排、长期跟踪、跨系统协调、多结果统一汇总，停止扩张并明确回交 Hermes。"
+        )
+    return (
+        f"当前层级：这是 capability={capability} 的 Hermes owner 轮次。\n"
+        "Hermes 负责全局推进、任务所有权、结果整合和最终用户接口。\n"
+        "收尾时必须明确且只明确一种状态：completed / blocked / waiting_user / delegated。\n"
+        "不要停在只分析、只建议、只给计划的半成品状态；低风险默认值直接执行。"
+    )
 
 
 def is_contract_retrieval_question(question: str) -> bool:
@@ -230,10 +263,12 @@ def build_ops_recovery_brief(question: str) -> str:
 def build_capability_route_brief(route: Dict[str, str], question: str) -> str:
     capability = str(route.get("capability") or "").strip()
     mode = str(route.get("mode") or "guided").strip().lower()
+    executor = str(route.get("executor") or "hermes").strip().lower()
     common = (
-        f"自动识别业务能力：{capability}（{mode}）\n"
+        f"自动识别业务能力：{capability}（{mode}，executor={executor}）\n"
         "先自己思考最有效的完成路径，再把 capability 当脚手架推进；不要退化成僵硬脚本。\n"
-        "输出中至少体现：目标、关键步骤、证据来源、结果、下一步。"
+        "输出中至少体现：目标、关键步骤、证据来源、结果、下一步。\n"
+        "不要把分析、建议或计划包装成已经完成。"
     )
     if capability == "bid_research":
         return common + "\n优先按投标检索工作流执行，不要退化成单关键词搜索。"
@@ -300,9 +335,11 @@ class FeishuCapabilityBridge:
     def build_effective_question(self, question: str) -> str:
         route = detect_capability_route(question)
         parts: List[str] = []
+        parts.append(_EXECUTION_TRUTHFULNESS_BRIEF)
         if is_codex_delegate_question(question):
             parts.append(build_codex_broker_brief(question))
         if route:
+            parts.append(build_executor_ownership_brief(route))
             parts.append(build_capability_route_brief(route, question))
         if is_contract_retrieval_question(question):
             parts.append(build_contract_retrieval_brief(question))
@@ -317,12 +354,14 @@ class FeishuCapabilityBridge:
         parts.append(f"用户问题：{question}")
         return "\n\n".join(parts)
 
-    def route_prefers_openclaw(self, route: Optional[Dict[str, str]]) -> bool:
+    def resolve_route_executor(self, route: Optional[Dict[str, str]]) -> Dict[str, Any]:
+        resolved = resolve_route_executor(route)
         if not self.config.offload_enabled or not route:
-            return False
-        capability = str(route.get("capability") or "").strip().lower()
-        executor = str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower()
-        return executor == "openclaw" and capability in self.config.offload_capabilities
+            return resolve_route_executor({"executor": "hermes"})
+        capability = str((route or {}).get("capability") or "").strip().lower()
+        if str(resolved.get("key") or "").strip().lower() == "openclaw" and capability not in self.config.offload_capabilities:
+            return resolve_route_executor({"executor": "hermes"})
+        return resolved
 
     def create_capability_run_for_route(
         self,
@@ -409,7 +448,12 @@ class FeishuCapabilityBridge:
             trace_id=str((run_record or {}).get("trace_id") or "").strip() or _new_trace_id(),
             executor=str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower(),
             tags=[
-                "executor:openclaw",
+                f"executor:{str(route.get('executor') or get_capability_execution_policy(capability).get('executor') or 'hermes').strip().lower()}",
+                *(
+                    ["runtime:openclaw"]
+                    if str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower() == "openclaw"
+                    else []
+                ),
                 "source:feishu",
                 f"capability:{capability}",
                 f"route_mode:{str(route.get('mode') or 'guided').strip().lower()}",
@@ -451,10 +495,14 @@ class FeishuCapabilityBridge:
                 update_capability_run_func(
                     run_id,
                     background_job_id=str(record.get("job_id") or "").strip(),
-                    current_focus="Queued for OpenClaw research worker.",
-                    next_step="Background worker will dispatch this run to OpenClaw and auto-deliver the result back to Feishu.",
+                    current_focus=(
+                        f"Queued for {str(route.get('executor') or get_capability_execution_policy(capability).get('executor') or 'hermes').strip().lower()} executor."
+                    ),
+                    next_step=(
+                        f"Background worker will dispatch this run to {str(route.get('executor') or get_capability_execution_policy(capability).get('executor') or 'hermes').strip().lower()} and auto-deliver the result back to Feishu."
+                    ),
                     output={
-                        "offloaded_to": "openclaw",
+                        "offloaded_to": str(route.get("executor") or get_capability_execution_policy(capability).get("executor") or "hermes").strip().lower(),
                         "background_job_id": str(record.get("job_id") or "").strip(),
                         "route_mode": str(route.get("mode") or "guided").strip().lower(),
                         "worker_kind": str(route.get("worker_kind") or "").strip().lower(),

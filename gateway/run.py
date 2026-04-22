@@ -79,6 +79,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
+_DEFAULT_GATEWAY_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/control-plane.ps1")
+_DEFAULT_WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -3036,6 +3038,54 @@ class GatewayRunner:
         if canonical == "status":
             return await self._handle_status_command(event)
 
+        if canonical == "task-board":
+            return await self._handle_control_plane_command(
+                "task-board",
+                unavailable_message="统一任务板暂不可用。",
+            )
+
+        if canonical == "control-tower":
+            return await self._handle_control_plane_command(
+                "control-tower",
+                unavailable_message="Control tower 暂不可用。",
+            )
+
+        if canonical == "secretary-loop":
+            return await self._handle_control_plane_command(
+                "secretary-loop",
+                unavailable_message="秘书动作暂不可用。",
+            )
+
+        if canonical == "operator-worklist":
+            return await self._handle_control_plane_command(
+                "operator-worklist",
+                unavailable_message="Operator worklist 暂不可用。",
+            )
+
+        if canonical == "job-status":
+            return await self._handle_control_plane_command(
+                "job-status",
+                unavailable_message="后台任务状态暂不可用。",
+            )
+
+        if canonical == "active-tasks":
+            return await self._handle_active_tasks_command()
+
+        if canonical == "pending-approvals":
+            return await self._handle_pending_approvals_command()
+
+        if canonical == "blocked-tasks":
+            return await self._handle_blocked_tasks_command()
+
+        if canonical == "recent-failures":
+            return await self._handle_recent_failures_command()
+
+        if canonical == "retry-delivery":
+            return await self._handle_retry_delivery_command(event)
+
+        if canonical == "follow-up":
+            return await self._handle_follow_up_command(event)
+
         if canonical == "restart":
             return await self._handle_restart_command(event)
         
@@ -4491,6 +4541,257 @@ class GatewayRunner:
         ])
 
         return "\n".join(lines)
+
+    async def _invoke_control_plane_action(self, action: str) -> Dict[str, Any]:
+        control_plane_script = Path(
+            os.getenv(
+                "HERMES_DINGTALK_CONTROL_PLANE_SCRIPT",
+                str(_DEFAULT_GATEWAY_CONTROL_PLANE_SCRIPT),
+            )
+        )
+        if not control_plane_script.exists():
+            return {
+                "ok": False,
+                "message": f"control-plane 不存在：{control_plane_script}",
+                "details": None,
+            }
+
+        powershell_bin = (
+            os.getenv("WINDOWS_POWERSHELL_BIN", _DEFAULT_WINDOWS_POWERSHELL).strip()
+            or _DEFAULT_WINDOWS_POWERSHELL
+        )
+
+        def _to_windows_path(path: Path) -> str:
+            raw = str(path)
+            if raw.startswith("/mnt/") and len(raw) > 6 and raw[5].isalpha() and raw[6] == "/":
+                drive = raw[5].upper()
+                rest = raw[7:].replace("/", "\\")
+                return f"{drive}:\\{rest}"
+            return raw
+
+        def _decode_output(raw: bytes) -> str:
+            if not raw:
+                return ""
+            for encoding in ("utf-8", "gb18030", "cp936"):
+                try:
+                    return raw.decode(encoding)
+                except UnicodeDecodeError:
+                    continue
+            return raw.decode("utf-8", errors="replace")
+
+        def _run() -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                [
+                    powershell_bin,
+                    "-NoLogo",
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-File",
+                    _to_windows_path(control_plane_script),
+                    action,
+                ],
+                capture_output=True,
+                text=False,
+                timeout=30,
+                check=False,
+            )
+
+        completed = await asyncio.to_thread(_run)
+        output = _decode_output(completed.stdout or completed.stderr or b"").strip()
+        if not output:
+            return {
+                "ok": completed.returncode == 0,
+                "message": "",
+                "details": None,
+            }
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return {
+                "ok": completed.returncode == 0,
+                "message": output,
+                "details": None,
+            }
+        return payload if isinstance(payload, dict) else {
+            "ok": completed.returncode == 0,
+            "message": output,
+            "details": None,
+        }
+
+    async def _handle_control_plane_command(self, action: str, *, unavailable_message: str) -> str:
+        payload = await self._invoke_control_plane_action(action)
+        if not bool(payload.get("ok")):
+            message = str(payload.get("message") or "").strip()
+            return message or unavailable_message
+        message = str(payload.get("message") or "").strip()
+        return message or unavailable_message
+
+    async def _invoke_repo_json_script(self, argv: list[str]) -> Dict[str, Any]:
+        repo_root = Path(__file__).resolve().parents[1]
+
+        def _run() -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [sys.executable, *argv],
+                cwd=str(repo_root),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+
+        completed = await asyncio.to_thread(_run)
+        output = (completed.stdout or completed.stderr or "").strip()
+        if not output:
+            return {"ok": completed.returncode == 0, "message": "", "details": None}
+        try:
+            payload = json.loads(output)
+        except json.JSONDecodeError:
+            return {
+                "ok": completed.returncode == 0,
+                "message": output,
+                "details": None,
+            }
+        return payload if isinstance(payload, dict) else {
+            "ok": completed.returncode == 0,
+            "message": output,
+            "details": None,
+        }
+
+    @staticmethod
+    def _extract_task_id_arg(raw_args: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.:-]", "", str(raw_args or "").strip())
+
+    @staticmethod
+    def _compact_scope_suffix(item: Dict[str, Any]) -> str:
+        parts: list[str] = []
+        task_scope = str(item.get("task_scope_key") or "").strip()
+        person_memory = str(item.get("person_memory_key") or "").strip()
+        if task_scope:
+            parts.append(f"task_scope={task_scope}")
+        if person_memory:
+            parts.append(f"person_memory={person_memory}")
+        return f" | {' | '.join(parts)}" if parts else ""
+
+    async def _handle_active_tasks_command(self) -> str:
+        payload = await self._invoke_control_plane_action("task-board")
+        if not bool(payload.get("ok")):
+            return str(payload.get("message") or "活跃任务暂不可用。").strip() or "活跃任务暂不可用。"
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        units = details.get("top_units") if isinstance(details, dict) else []
+        active_units = [
+            item for item in (units or [])
+            if str((item or {}).get("status") or "").strip().lower() not in {"completed", "cancelled", "failed"}
+        ]
+        if not active_units:
+            return "当前没有活跃任务。"
+        lines = ["活跃任务"]
+        for item in active_units[:5]:
+            status = str(item.get("status") or "-").strip()
+            title = str(item.get("title") or item.get("unit_id") or "-").strip()
+            lines.append(f"- {status} | {title}{self._compact_scope_suffix(item)}")
+        return "\n".join(lines)
+
+    async def _handle_pending_approvals_command(self) -> str:
+        payload = await self._invoke_control_plane_action("secretary-loop")
+        if not bool(payload.get("ok")):
+            return str(payload.get("message") or "待批准列表暂不可用。").strip() or "待批准列表暂不可用。"
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        actions = details.get("actions") if isinstance(details, dict) else []
+        approvals = [
+            item for item in (actions or [])
+            if str((item or {}).get("dispatch_action") or "").strip().lower() == "wait_approval"
+        ]
+        if not approvals:
+            return "当前没有待批准任务。"
+        lines = ["待批准任务"]
+        for item in approvals[:5]:
+            title = str(item.get("task_title") or item.get("task_id") or "-").strip()
+            next_step = str(item.get("next_step") or "").strip()
+            line = f"- {title}{self._compact_scope_suffix(item)}"
+            if next_step:
+                line += f"\n  下一步: {next_step}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def _handle_blocked_tasks_command(self) -> str:
+        payload = await self._invoke_control_plane_action("secretary-loop")
+        if not bool(payload.get("ok")):
+            return str(payload.get("message") or "阻塞任务暂不可用。").strip() or "阻塞任务暂不可用。"
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        actions = details.get("actions") if isinstance(details, dict) else []
+        blocked = [
+            item for item in (actions or [])
+            if str((item or {}).get("status") or "").strip().lower() in {"pending_approval", "blocked", "failed"}
+        ]
+        if not blocked:
+            return "当前没有明显卡住的任务。"
+        lines = ["卡住的任务"]
+        for item in blocked[:5]:
+            status = str(item.get("status") or "-").strip()
+            title = str(item.get("task_title") or item.get("task_id") or "-").strip()
+            reason = str(item.get("reason") or item.get("recovery_hint") or "").strip()
+            line = f"- {status} | {title}{self._compact_scope_suffix(item)}"
+            if reason:
+                line += f"\n  原因: {reason}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def _handle_recent_failures_command(self) -> str:
+        payload = await self._invoke_control_plane_action("task-board")
+        if not bool(payload.get("ok")):
+            return str(payload.get("message") or "最近失败列表暂不可用。").strip() or "最近失败列表暂不可用。"
+        details = payload.get("details") if isinstance(payload.get("details"), dict) else {}
+        units = details.get("top_units") if isinstance(details, dict) else []
+        failures = [
+            item for item in (units or [])
+            if str((item or {}).get("status") or "").strip().lower() == "failed"
+        ]
+        if not failures:
+            return "最近没有失败任务。"
+        lines = ["最近失败"]
+        for item in failures[:5]:
+            title = str(item.get("title") or item.get("unit_id") or "-").strip()
+            blocker = str(item.get("blocker") or item.get("current_focus") or "").strip()
+            line = f"- {title}{self._compact_scope_suffix(item)}"
+            if blocker:
+                line += f"\n  阻塞: {blocker}"
+            lines.append(line)
+        return "\n".join(lines)
+
+    async def _handle_retry_delivery_command(self, event: MessageEvent) -> str:
+        task_id = self._extract_task_id_arg(event.get_command_args())
+        if not task_id:
+            return "用法: /retry-delivery <task-id>"
+        payload = await self._invoke_repo_json_script(
+            [
+                "scripts/secretary_action.py",
+                "--task-id",
+                task_id,
+                "--action",
+                "retry_delivery",
+                "--auto-safe-only",
+                "--json",
+            ]
+        )
+        message = str(payload.get("message") or "").strip()
+        return message or "重投递已执行。"
+
+    async def _handle_follow_up_command(self, event: MessageEvent) -> str:
+        task_id = self._extract_task_id_arg(event.get_command_args())
+        if not task_id:
+            return "用法: /follow-up <task-id>"
+        payload = await self._invoke_repo_json_script(
+            [
+                "scripts/secretary_follow_up.py",
+                "--task-id",
+                task_id,
+                "--json",
+            ]
+        )
+        message = str(payload.get("message") or "").strip()
+        return message or "催继续已发送。"
     
     async def _handle_stop_command(self, event: MessageEvent) -> str:
         """Handle /stop command - interrupt a running agent.

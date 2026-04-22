@@ -73,12 +73,49 @@ def test_run_openclaw_for_job_uses_popen_pipe_streams(monkeypatch):
     returncode, stdout, stderr = mod._run_openclaw_for_job(job, timeout=5)
 
     assert returncode == 0
-    assert stdout == "done\n\nOpenClaw agent: hermes-research"
+    assert "OpenClaw 研究交付" in stdout
+    assert "任务: demo" in stdout
+    assert "Agent: hermes-research" in stdout
+    assert "结论\ndone" in stdout
     assert stderr == ""
     assert updates == [
         {"job_id": "job-123", "runner_pid": 4321, "runner_runtime": "openclaw"},
         {"job_id": "job-123", "runner_pid": None, "runner_runtime": ""},
     ]
+
+
+def test_openclaw_runner_prompt_includes_shared_collaboration_policy(monkeypatch, tmp_path):
+    policy_path = tmp_path / "hermes-openclaw-collaboration-policy.md"
+    policy_path.write_text("Hermes orchestrates.\nOpenClaw investigates.", encoding="utf-8")
+    monkeypatch.setenv("HERMES_COLLABORATION_POLICY_FILE", str(policy_path))
+    monkeypatch.setenv("HERMES_OPENCLAW_AGENT", "hermes-research")
+
+    mod = load_module()
+    prompt = mod._build_openclaw_runner_prompt({"job_id": "job-1", "title": "demo", "tags": []})
+
+    assert "Hermes orchestrates." in prompt
+    assert "OpenClaw investigates." in prompt
+
+
+def test_format_openclaw_research_report_preserves_sections():
+    mod = load_module()
+
+    report = mod._format_openclaw_research_report(
+        {"job_id": "job-1", "title": "合同检索", "tags": ["capability:contract_retrieval"]},
+        "Outcome\n拿到 1 条高可信线索\n\nEvidence\n- https://example.com/contract.pdf\n\nBest next move\n继续核验附件原件",
+        agent="hermes-research",
+        provider="openrouter",
+        model="gpt-5.4",
+        usage_total=321,
+    )
+
+    assert "OpenClaw 研究交付" in report
+    assert "能力: contract_retrieval" in report
+    assert "模型: openrouter / gpt-5.4" in report
+    assert "Tokens(total): 321" in report
+    assert "结论\n拿到 1 条高可信线索" in report
+    assert "证据与来源\n- https://example.com/contract.pdf" in report
+    assert "建议下一步\n继续核验附件原件" in report
 
 
 def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):

@@ -745,7 +745,7 @@ def _validate_gateway_config(config: "GatewayConfig") -> None:
     # of a confusing "auth failed" from the platform API.
     try:
         from hermes_cli.auth import has_usable_secret
-    except ImportError:
+    except (ImportError, TypeError):
         has_usable_secret = None  # type: ignore[assignment]
 
     if has_usable_secret is not None:

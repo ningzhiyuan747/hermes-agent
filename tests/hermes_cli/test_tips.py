@@ -1,6 +1,7 @@
 """Tests for hermes_cli/tips.py — random tip display at session start."""
 
 import pytest
+from agent.prompt_builder import CONTEXT_FILE_MAX_CHARS
 from hermes_cli.tips import TIPS, get_random_tip
 
 
@@ -31,6 +32,24 @@ class TestTipsCorpus:
     def test_no_leading_trailing_whitespace(self):
         for i, tip in enumerate(TIPS):
             assert tip == tip.strip(), f"Tip {i} has leading/trailing whitespace"
+
+    def test_context_scan_tip_mentions_all_loaded_context_files(self):
+        matches = [tip for tip in TIPS if "security-scanned for prompt injection" in tip]
+        assert matches, "Expected a context security scan tip"
+        tip = matches[0]
+        for expected in (".hermes.md", "HERMES.md", "AGENTS.md", "CLAUDE.md", ".cursorrules", "SOUL.md"):
+            assert expected in tip
+
+    def test_context_priority_tip_matches_runtime_priority(self):
+        matches = [tip for tip in TIPS if "first match" in tip and ".hermes.md" in tip]
+        assert matches, "Expected a context priority tip"
+        tip = matches[0]
+        for expected in (".hermes.md", "AGENTS.md", "CLAUDE.md", ".cursorrules"):
+            assert expected in tip
+
+    def test_context_truncation_tip_matches_runtime_limit(self):
+        expected = f"Context files are capped at {CONTEXT_FILE_MAX_CHARS:,} characters".replace(",", ",")
+        assert any(expected in tip for tip in TIPS)
 
 
 class TestGetRandomTip:

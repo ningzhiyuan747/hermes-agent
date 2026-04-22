@@ -266,7 +266,7 @@ FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES = {
     item.strip().lower()
     for item in os.getenv(
         "FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES",
-        "bid_research,contract_retrieval,customer_followup,ops_recovery",
+        "bid_research,contract_retrieval",
     ).split(",")
     if item.strip()
 }
@@ -500,8 +500,8 @@ def _detect_capability_route(question: str) -> Optional[Dict[str, str]]:
     return None
 
 
-def _route_prefers_openclaw(route: Optional[Dict[str, str]]) -> bool:
-    return FEISHU_CAPABILITY_BRIDGE.route_prefers_openclaw(route)
+def _resolve_route_executor(route: Optional[Dict[str, str]]) -> Dict[str, Any]:
+    return FEISHU_CAPABILITY_BRIDGE.resolve_route_executor(route)
     if not FEISHU_OPENCLAW_OFFLOAD_ENABLED or not route:
         return False
     return str(route.get("capability") or "").strip().lower() in FEISHU_OPENCLAW_OFFLOAD_CAPABILITIES
@@ -3668,7 +3668,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._capability_route_service = CapabilityRouteService(
                 CapabilityRouteServiceDeps(
                     detect_capability_route=_detect_capability_route,
-                    route_prefers_openclaw=_route_prefers_openclaw,
+                    resolve_route_executor=_resolve_route_executor,
                     create_capability_run=self._create_capability_run_for_route,
                     create_background_job=self._create_background_job_for_route,
                 )

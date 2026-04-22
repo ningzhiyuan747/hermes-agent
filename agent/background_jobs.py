@@ -11,8 +11,17 @@ from typing import Any, Dict, List, Optional
 from hermes_constants import get_hermes_home
 
 try:
-    from agent.business_db import insert_background_job_event, upsert_background_job
+    from agent.business_db import (
+        _ensure_task_for_origin,
+        get_task,
+        get_channel_task,
+        insert_background_job_event,
+        upsert_background_job,
+    )
 except Exception:  # pragma: no cover - DB must not break the JSON fallback path.
+    _ensure_task_for_origin = None  # type: ignore[assignment]
+    get_task = None  # type: ignore[assignment]
+    get_channel_task = None  # type: ignore[assignment]
     insert_background_job_event = None  # type: ignore[assignment]
     upsert_background_job = None  # type: ignore[assignment]
 
@@ -93,6 +102,80 @@ def _mirror_event_to_db(job_id: str, event: Dict[str, Any]) -> None:
         pass
 
 
+def _tag_value(tags: List[str], prefix: str) -> str:
+    expected = f"{str(prefix or '').strip().lower()}:"
+    if not expected or expected == ":":
+        return ""
+    for tag in tags:
+        normalized = str(tag or "").strip()
+        if normalized.lower().startswith(expected):
+            return normalized.split(":", 1)[1].strip()
+    return ""
+
+
+def _sync_task_control(task_id: str) -> None:
+    normalized = str(task_id or "").strip()
+    if not normalized:
+        return
+    try:
+        from agent.task_panel_service import sync_task_control_state
+
+        sync_task_control_state(normalized)
+    except Exception:
+        pass
+
+
+def _resolve_task_id_for_record(record: Dict[str, Any], *, create_if_missing: bool = False) -> str:
+    current_task_id = str(record.get("task_id") or "").strip()
+    if current_task_id:
+        return current_task_id
+
+    tags = [str(item).strip() for item in (record.get("tags") or []) if str(item).strip()]
+    scope_task_id = _tag_value(tags, "task_scope")
+    if scope_task_id.startswith("task:"):
+        resolved = scope_task_id.split(":", 1)[1].strip()
+        if resolved and (get_task is None or get_task(resolved)):
+            record["task_id"] = resolved
+            return resolved
+
+    origin = record.get("origin") if isinstance(record.get("origin"), dict) else {}
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    thread_id = str(origin.get("thread_id") or "").strip()
+    if platform and chat_id and get_channel_task is not None:
+        try:
+            bound = get_channel_task(platform=platform, chat_id=chat_id, thread_id=thread_id) or {}
+        except Exception:
+            bound = {}
+        task = bound.get("task") if isinstance(bound, dict) else None
+        bound_task_id = str((task or {}).get("task_id") or "").strip()
+        if bound_task_id:
+            record["task_id"] = bound_task_id
+            return bound_task_id
+
+    if create_if_missing and _ensure_task_for_origin is not None and platform and chat_id:
+        try:
+            created_task_id = _ensure_task_for_origin(
+                title=str(record.get("title") or "").strip(),
+                goal=str(record.get("prompt") or "").strip(),
+                actor_user_id=str(record.get("user_id") or "").strip(),
+                session_id=str(record.get("session_id") or "").strip(),
+                origin=origin,
+                metadata={
+                    "materialized_by": "background_job.create_job",
+                    "executor": str(record.get("executor") or "").strip(),
+                    "background_job": True,
+                },
+            )
+        except Exception:
+            created_task_id = ""
+        if created_task_id:
+            record["task_id"] = created_task_id
+            return created_task_id
+
+    return ""
+
+
 def _append_event(job_dir: Path, event: Dict[str, Any], *, job_id: str = "") -> None:
     event = {
         "timestamp_unix": _now(),
@@ -129,6 +212,7 @@ def create_job(
     record: Dict[str, Any] = {
         "job_id": job_id,
         "trace_id": _normalize_trace_id(trace_id),
+        "task_id": "",
         "title": _short_title(title or prompt),
         "prompt": str(prompt or "").strip(),
         "status": "queued",
@@ -152,9 +236,11 @@ def create_job(
         "runner_pid": None,
         "runner_runtime": "",
     }
+    _resolve_task_id_for_record(record, create_if_missing=True)
     _atomic_write_json(job_dir / "job.json", record)
     _mirror_job_to_db(record)
     _append_event(job_dir, {"kind": "created", "status": "queued", "message": record["title"]}, job_id=job_id)
+    _sync_task_control(str(record.get("task_id") or "").strip())
     return record
 
 
@@ -187,6 +273,7 @@ def update_job(job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
 
     allowed = {
         "status",
+        "task_id",
         "current_focus",
         "next_step",
         "blocker",
@@ -207,6 +294,7 @@ def update_job(job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         if key in allowed and value is not None:
             record[key] = value
     record["updated_at_unix"] = _now()
+    _resolve_task_id_for_record(record, create_if_missing=False)
     _atomic_write_json(job_dir / "job.json", record)
     _mirror_job_to_db(record)
     _append_event(
@@ -218,6 +306,7 @@ def update_job(job_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
         },
         job_id=job_id,
     )
+    _sync_task_control(str(record.get("task_id") or "").strip())
     return record
 
 

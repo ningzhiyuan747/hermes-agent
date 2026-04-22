@@ -134,15 +134,41 @@ class TestJsonFields:
 
 class TestAuthHeaders:
     def test_bearer_token(self):
-        text = "Authorization: Bearer sk-proj-abc123def456ghi789jkl012"
+        token = "a" * 24
+        text = f"Authorization: Bearer {token}"
         result = redact_sensitive_text(text)
         assert "Authorization: Bearer" in result
-        assert "abc123def456" not in result
+        assert token not in result
 
     def test_case_insensitive(self):
-        text = "authorization: bearer mytoken123456789012345678"
+        token = "b" * 24
+        text = f"authorization: bearer {token}"
         result = redact_sensitive_text(text)
-        assert "mytoken12345" not in result
+        assert token not in result
+
+
+class TestUrlQuerySecrets:
+    def test_api_key_query_param(self):
+        secret = "supersecretvalue1234567890"
+        text = f"https://example.com/ws?api_key={secret}&client=hermes"
+        result = redact_sensitive_text(text)
+        assert secret not in result
+        assert "?api_key=" in result
+        assert "client=hermes" in result
+
+    def test_session_api_key_query_param(self):
+        secret = "sessionsecret1234567890"
+        text = f"wss://example.com/socket?session_api_key={secret}"
+        result = redact_sensitive_text(text)
+        assert secret not in result
+        assert "session_api_key=" in result
+
+    def test_access_token_fragment_boundary(self):
+        token = "eyJ" + ("a" * 24)
+        text = f"https://example.com/callback?access_token={token}#section"
+        result = redact_sensitive_text(text)
+        assert token not in result
+        assert "#section" in result
 
 
 class TestTelegramTokens:
@@ -153,7 +179,7 @@ class TestTelegramTokens:
         assert "123456789:***" in result
 
     def test_raw_token(self):
-        text = "12345678901:ABCDEfghijKLMNopqrstUVWXyz1234567890"
+        text = "12345678901:ABCDEfghij-KLMNopqrst_UVWXyz12345"
         result = redact_sensitive_text(text)
         assert "ABCDEfghij" not in result
 
@@ -227,14 +253,28 @@ USER=teknium"""
 
 class TestSecretCapturePayloadRedaction:
     def test_secret_value_field_redacted(self):
-        text = '{"success": true, "secret_value": "sk-test-secret-1234567890"}'
-        result = redact_sensitive_text(text)
-        assert "sk-test-secret-1234567890" not in result
-
-    def test_raw_secret_field_redacted(self):
-        text = '{"raw_secret": "ghp_abc123def456ghi789jkl"}'
+        text = '{"success": true, "secret_value": "sk-test-abc123def456ghi7890"}'
         result = redact_sensitive_text(text)
         assert "abc123def456" not in result
+
+    def test_raw_secret_field_redacted(self):
+        text = '{"raw_secret": "abc123def456ghi7890"}'
+        result = redact_sensitive_text(text)
+        assert "abc123def456" not in result
+
+    def test_python_repr_secret_value_field_redacted(self):
+        secret = "sk-test-abc123def456ghi7890"
+        text = f"{{'secret_value': '{secret}', 'status': 'ok'}}"
+        result = redact_sensitive_text(text)
+        assert secret not in result
+        assert "'status': 'ok'" in result
+
+    def test_python_repr_session_api_key_field_redacted(self):
+        secret = "sessionsecret1234567890"
+        text = f"{{'session_api_key': '{secret}', 'other': 1}}"
+        result = redact_sensitive_text(text)
+        assert secret not in result
+        assert "'session_api_key': '" in result
 
 
 class TestElevenLabsTavilyExaKeys:

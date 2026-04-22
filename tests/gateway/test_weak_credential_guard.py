@@ -5,6 +5,7 @@ tokens at gateway startup instead of letting them silently fail
 against platform APIs.
 """
 
+import builtins
 import logging
 
 import pytest
@@ -100,6 +101,22 @@ class TestPlatformTokenPlaceholderGuard:
             _validate_and_return(config)
         assert config.platforms[Platform.TELEGRAM].enabled is False
 
+    def test_typeerror_in_auth_helper_import_does_not_crash_validation(self, monkeypatch, caplog):
+        """Broken optional imports should degrade gracefully, not crash startup."""
+        config = _make_gateway_config(Platform.TELEGRAM, "***")
+        original_import = builtins.__import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hermes_cli.auth":
+                raise TypeError("broken optional dependency")
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        with caplog.at_level(logging.ERROR):
+            _validate_and_return(config)
+        assert config.platforms[Platform.TELEGRAM].enabled is True
+        assert "broken optional dependency" not in caplog.text
+
 
 # ---------------------------------------------------------------------------
 # Integration test: API server placeholder key on network-accessible host
@@ -139,3 +156,26 @@ class TestAPIServerPlaceholderKeyGuard:
         )
         # On loopback the placeholder guard doesn't fire
         assert is_network_accessible(adapter._host) is False
+
+    @pytest.mark.asyncio
+    async def test_typeerror_in_auth_helper_import_does_not_crash_connect(self, monkeypatch):
+        """Broken optional auth helper imports should not abort API server startup."""
+        from gateway.platforms.api_server import APIServerAdapter
+
+        adapter = APIServerAdapter(
+            PlatformConfig(enabled=True, extra={"host": "127.0.0.1", "key": "realistic-secret-key"})
+        )
+        original_import = builtins.__import__
+
+        def guarded_import(name, globals=None, locals=None, fromlist=(), level=0):
+            if name == "hermes_cli.auth":
+                raise TypeError("broken optional dependency")
+            return original_import(name, globals, locals, fromlist, level)
+
+        monkeypatch.setattr(builtins, "__import__", guarded_import)
+        try:
+            result = await adapter.connect()
+            assert result is True
+        finally:
+            if adapter._runner is not None:
+                await adapter.disconnect()

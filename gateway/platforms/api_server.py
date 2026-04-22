@@ -2365,7 +2365,7 @@ class APIServerAdapter(BasePlatformAdapter):
                             self.name, self._host,
                         )
                         return False
-                except ImportError:
+                except (ImportError, TypeError):
                     pass
 
             # Port conflict detection — fail fast if port is already in use

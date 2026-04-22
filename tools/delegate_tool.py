@@ -20,11 +20,15 @@ import json
 import logging
 logger = logging.getLogger(__name__)
 import os
+from pathlib import Path
+import re
 import threading
 import time
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, Optional
 
+from hermes_constants import get_hermes_home
 from toolsets import TOOLSETS
 
 
@@ -145,6 +149,267 @@ def _resolve_workspace_hint(parent_agent) -> Optional[str]:
         if os.path.isabs(text) and os.path.isdir(text):
             return text
     return None
+
+
+def _safe_path_component(value: Any, *, fallback: str = "unknown") -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
+    normalized = normalized.strip("._")
+    return normalized[:96] or fallback
+
+
+def _delegation_tasks_root() -> Path:
+    root = get_hermes_home() / "delegation_tasks"
+    root.mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def _scope_context_from_parent(parent_agent) -> dict[str, str]:
+    session_key = str(getattr(parent_agent, "_gateway_session_key", None) or getattr(parent_agent, "session_id", "") or "").strip()
+    platform = str(getattr(parent_agent, "platform", "") or "").strip().lower()
+    actor_user_id = str(getattr(parent_agent, "_user_id", "") or "").strip()
+    chat_id = ""
+    thread_id = ""
+    if session_key:
+        parts = session_key.split(":")
+        if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
+            platform = str(parts[2] or "").strip().lower() or platform
+            chat_type = str(parts[3] or "").strip().lower()
+            chat_id = str(parts[4] or "").strip()
+            if chat_type == "thread" and len(parts) >= 6:
+                thread_id = str(parts[5] or "").strip()
+            if not actor_user_id and len(parts) >= 6:
+                actor_user_id = str(parts[-1] or "").strip()
+
+    task_scope_key = ""
+    conversation_role = "system"
+    if platform and chat_id:
+        task_scope_key = f"{platform}:chat:{chat_id}"
+        if thread_id:
+            task_scope_key += f":thread:{thread_id}"
+        if platform == "dingtalk":
+            conversation_role = "task_group"
+        else:
+            conversation_role = "chat_surface"
+
+    person_memory_key = ""
+    if platform and actor_user_id:
+        person_memory_key = f"{platform}:user:{actor_user_id}"
+    elif actor_user_id:
+        person_memory_key = f"user:{actor_user_id}"
+
+    return {
+        "session_key": session_key,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "actor_user_id": actor_user_id,
+        "task_scope_key": task_scope_key,
+        "person_memory_key": person_memory_key,
+        "conversation_role": conversation_role,
+    }
+
+
+def _ensure_delegation_control_task(parent_agent, goal: str, scope: dict[str, str]) -> tuple[str, bool]:
+    from agent.business_db import _ensure_task_for_origin, create_task, get_task
+
+    session_id = str(scope.get("session_key") or getattr(parent_agent, "session_id", "") or "").strip()
+    platform = str(scope.get("platform") or getattr(parent_agent, "platform", "") or "").strip().lower()
+    actor_user_id = str(scope.get("actor_user_id") or "").strip()
+    chat_id = str(scope.get("chat_id") or "").strip()
+    thread_id = str(scope.get("thread_id") or "").strip()
+
+    resolved_task_id = ""
+    standalone_control = False
+    if platform and chat_id:
+        resolved_task_id = _ensure_task_for_origin(
+            title=str(goal or "").strip(),
+            goal=str(goal or "").strip(),
+            actor_user_id=actor_user_id,
+            session_id=session_id,
+            origin={
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "chat_name": "",
+                "chat_type": "",
+            },
+            metadata={
+                "auto_materialized": True,
+                "materialized_by": "delegate_task.create",
+                "delegation_task": True,
+            },
+        )
+        task = get_task(resolved_task_id) if resolved_task_id else None
+        task_metadata = task.get("metadata") if isinstance(task, dict) and isinstance(task.get("metadata"), dict) else {}
+        standalone_control = str(task_metadata.get("materialized_by") or "").strip() == "delegate_task.create"
+    else:
+        created = create_task(
+            title=str(goal or "").strip(),
+            goal=str(goal or "").strip(),
+            owner_user_id=actor_user_id,
+            source_platform=platform,
+            source_chat_id="",
+            source_thread_id="",
+            source_session_id=session_id,
+            metadata={
+                "auto_materialized": True,
+                "materialized_by": "delegate_task.create",
+                "delegation_task": True,
+                "standalone_control": True,
+            },
+        )
+        resolved_task_id = str((created or {}).get("task_id") or "").strip()
+        standalone_control = bool(resolved_task_id)
+
+    return resolved_task_id, standalone_control
+
+
+def _write_delegation_current_state(record: dict[str, Any]) -> None:
+    path = Path(str(record.get("current_state_path") or "").strip())
+    if not path:
+        return
+    lines = [
+        "## Current Focus",
+        str(record.get("current_focus") or "").strip() or "No current focus recorded.",
+        "",
+        "## Next Step",
+        str(record.get("next_step") or "").strip() or "No next step recorded.",
+        "",
+        "## Blockers",
+        str(record.get("blocker") or "").strip() or "None.",
+        "",
+    ]
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def _append_delegation_event(record: dict[str, Any], *, kind: str, note: str) -> None:
+    path = Path(str(record.get("progress_log_path") or "").strip())
+    if not path:
+        return
+    entry = {
+        "timestamp_unix": int(time.time()),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "kind": str(kind or "progress").strip(),
+        "status": str(record.get("status") or "").strip(),
+        "note": str(note or "").strip(),
+        "focus": str(record.get("current_focus") or "").strip(),
+        "next_step": str(record.get("next_step") or "").strip(),
+        "blocker": str(record.get("blocker") or "").strip(),
+    }
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+
+def _sync_delegation_control_task(record: dict[str, Any]) -> None:
+    control_task_id = str(record.get("control_task_id") or "").strip()
+    if not control_task_id:
+        return
+
+    try:
+        from agent.task_panel_service import sync_task_control_state
+
+        sync_task_control_state(control_task_id)
+    except Exception:
+        pass
+
+    if not bool(record.get("standalone_control")):
+        return
+
+    from agent.business_db import get_task, update_task
+
+    task = get_task(control_task_id)
+    if not isinstance(task, dict):
+        return
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    updated_metadata = dict(metadata)
+    updated_metadata["control_plane"] = {
+        **(metadata.get("control_plane") if isinstance(metadata.get("control_plane"), dict) else {}),
+        "status": str(record.get("status") or "open").strip().lower(),
+        "current_executor": str(record.get("worker_role") or "").strip(),
+        "current_focus": str(record.get("current_focus") or "").strip(),
+        "next_step": str(record.get("next_step") or "").strip(),
+        "blocker": str(record.get("blocker") or "").strip(),
+        "task_scope_key": str(record.get("task_scope_key") or f"task:{control_task_id}").strip(),
+        "person_memory_key": str(record.get("person_memory_key") or "").strip(),
+    }
+    update_task(
+        control_task_id,
+        status=str(record.get("status") or "open").strip().lower(),
+        metadata=updated_metadata,
+    )
+
+
+def _write_delegation_meta(record: dict[str, Any]) -> None:
+    meta_path = Path(str(record.get("_meta_path") or "").strip())
+    if not meta_path:
+        return
+    persisted = {key: value for key, value in record.items() if not str(key).startswith("_")}
+    meta_path.write_text(json.dumps(persisted, ensure_ascii=False, indent=2), encoding="utf-8")
+    _write_delegation_current_state(record)
+    _sync_delegation_control_task(record)
+
+
+def _update_delegation_record(record: dict[str, Any], *, event_kind: str = "", event_note: str = "", final_report: str = "", **changes: Any) -> dict[str, Any]:
+    for key, value in changes.items():
+        if value is not None:
+            record[key] = value
+    record["updated_at_unix"] = int(time.time())
+    _write_delegation_meta(record)
+    if event_kind:
+        _append_delegation_event(record, kind=event_kind, note=event_note or "Delegation updated.")
+    if final_report:
+        report_path = Path(str(record.get("final_report_path") or "").strip())
+        if report_path:
+            report_path.write_text(str(final_report), encoding="utf-8")
+    return record
+
+
+def _initialize_delegation_record(*, task_index: int, goal: str, child, parent_agent) -> dict[str, Any]:
+    scope = _scope_context_from_parent(parent_agent)
+    control_task_id, standalone_control = _ensure_delegation_control_task(parent_agent, goal, scope)
+    now = int(time.time())
+    parent_session_id = str(getattr(parent_agent, "session_id", "") or "").strip()
+    child_session_id = str(getattr(child, "session_id", "") or "").strip()
+    delegation_task_id = f"task-{task_index}-{now}-{uuid.uuid4().hex[:10]}"
+    task_dir = _delegation_tasks_root() / _safe_path_component(parent_session_id or "detached-parent", fallback="detached-parent") / delegation_task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+
+    worker_role = "subagent"
+    requested_toolsets = list(getattr(child, "enabled_toolsets", []) or [])
+    record: dict[str, Any] = {
+        "task_id": delegation_task_id,
+        "control_task_id": control_task_id,
+        "goal": str(goal or "").strip(),
+        "status": "created",
+        "parent_session_id": parent_session_id,
+        "child_session_id": child_session_id,
+        "platform": str(scope.get("platform") or "").strip(),
+        "worker_role": worker_role,
+        "role": worker_role,
+        "role_title": "Subagent Worker",
+        "requested_toolsets": requested_toolsets,
+        "effective_toolsets": requested_toolsets,
+        "task_scope_key": str(scope.get("task_scope_key") or (f"task:{control_task_id}" if control_task_id else "")).strip(),
+        "person_memory_key": str(scope.get("person_memory_key") or "").strip(),
+        "conversation_role": str(scope.get("conversation_role") or ("task_unit" if control_task_id else "system")).strip(),
+        "current_focus": "Delegation task created; waiting for the child agent to start.",
+        "next_step": "Start the child agent and collect the result.",
+        "blocker": "",
+        "memory_policy": "No long-term worker memory. Return a structured handoff to the parent.",
+        "created_at_unix": now,
+        "updated_at_unix": now,
+        "started_at_unix": None,
+        "finished_at_unix": None,
+        "task_state_path": str(task_dir / "task-state.md"),
+        "current_state_path": str(task_dir / "current-state.md"),
+        "progress_log_path": str(task_dir / "progress.jsonl"),
+        "final_report_path": str(task_dir / "final-report.md"),
+        "standalone_control": standalone_control,
+        "_meta_path": str(task_dir / "task-meta.json"),
+    }
+    _write_delegation_meta(record)
+    _append_delegation_event(record, kind="created", note="Delegation task created.")
+    return record
 
 
 def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
@@ -394,6 +659,16 @@ def _build_child_agent(
         else:
             parent_agent._active_children.append(child)
 
+    try:
+        child._delegation_record = _initialize_delegation_record(
+            task_index=task_index,
+            goal=goal,
+            child=child,
+            parent_agent=parent_agent,
+        )
+    except Exception as exc:
+        logger.debug("Could not initialize delegation record: %s", exc)
+
     return child
 
 def _run_single_child(
@@ -411,6 +686,19 @@ def _run_single_child(
 
     # Get the progress callback from the child agent
     child_progress_cb = getattr(child, 'tool_progress_callback', None)
+    delegation_record = getattr(child, "_delegation_record", None)
+    if isinstance(delegation_record, dict):
+        _update_delegation_record(
+            delegation_record,
+            status="running",
+            started_at_unix=int(time.time()),
+            child_session_id=str(getattr(child, "session_id", "") or "").strip(),
+            current_focus="Delegation worker is running.",
+            next_step="Wait for the worker to finish and collect the result.",
+            blocker="",
+            event_kind="started",
+            event_note="Delegation worker started.",
+        )
 
     # Restore parent tool names using the value saved before child construction
     # mutated the global. This is the correct parent toolset, not the child's.
@@ -563,11 +851,52 @@ def _run_single_child(
         if status == "failed":
             entry["error"] = result.get("error", "Subagent did not produce a response.")
 
+        if isinstance(delegation_record, dict):
+            final_status = {
+                "completed": "completed",
+                "interrupted": "cancelled",
+                "failed": "failed",
+            }.get(status, "failed")
+            final_note = str(summary or result.get("error") or "Delegation finished.").strip()
+            _update_delegation_record(
+                delegation_record,
+                status=final_status,
+                finished_at_unix=int(time.time()),
+                duration_seconds=duration,
+                current_focus={
+                    "completed": "Delegation task completed.",
+                    "cancelled": "Delegation task was interrupted.",
+                    "failed": "Delegation task failed.",
+                }.get(final_status, "Delegation finished."),
+                next_step={
+                    "completed": "Review the delegated summary and continue the parent task.",
+                    "cancelled": "Decide whether to relaunch the delegation.",
+                    "failed": "Inspect the delegated failure and decide whether to retry.",
+                }.get(final_status, ""),
+                blocker="" if final_status == "completed" else str(result.get("error") or "").strip(),
+                event_kind="completed" if final_status == "completed" else "failed",
+                event_note=final_note,
+                final_report=final_note or "No final report recorded.",
+            )
+
         return entry
 
     except Exception as exc:
         duration = round(time.monotonic() - child_start, 2)
         logging.exception(f"[subagent-{task_index}] failed")
+        if isinstance(delegation_record, dict):
+            _update_delegation_record(
+                delegation_record,
+                status="failed",
+                finished_at_unix=int(time.time()),
+                duration_seconds=duration,
+                current_focus="Delegation task failed.",
+                next_step="Inspect the delegated failure and decide whether to retry.",
+                blocker=str(exc),
+                event_kind="failed",
+                event_note=str(exc),
+                final_report=str(exc),
+            )
         return {
             "task_index": task_index,
             "status": "error",

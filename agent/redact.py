@@ -62,16 +62,32 @@ _ENV_ASSIGN_RE = re.compile(
     rf"([A-Z0-9_]{{0,50}}{_SECRET_ENV_NAMES}[A-Z0-9_]{{0,50}})\s*=\s*(['\"]?)(\S+)\2",
 )
 
-# JSON field patterns: "apiKey": "value", "token": "value", etc.
-_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material)"
+# JSON field patterns: "apiKey": "***", "token": "***", etc.
+_JSON_KEY_NAMES = r"(?:api_?[Kk]ey|token|secret|password|access_token|refresh_token|auth_token|bearer|secret_value|raw_secret|secret_input|key_material|session_api_key)"
 _JSON_FIELD_RE = re.compile(
     rf'("{_JSON_KEY_NAMES}")\s*:\s*"([^"]+)"',
+    re.IGNORECASE,
+)
+
+# Python dict / repr style fields: {'api_key': '***', 'session_api_key': '***'}
+_PYTHON_FIELD_RE = re.compile(
+    rf"('{_JSON_KEY_NAMES}')\s*:\s*'([^']+)'",
     re.IGNORECASE,
 )
 
 # Authorization headers
 _AUTH_HEADER_RE = re.compile(
     r"(Authorization:\s*Bearer\s+)(\S+)",
+    re.IGNORECASE,
+)
+
+# Secret-bearing URL query params: ?api_key=..., &session_api_key=..., etc.
+_QUERY_SECRET_NAMES = (
+    r"(?:api(?:[_-]?key)?|session[_-]?api[_-]?key|access[_-]?token|"
+    r"refresh[_-]?token|auth[_-]?token|token|secret|password|bearer)"
+)
+_QUERY_PARAM_RE = re.compile(
+    rf"([?&]{_QUERY_SECRET_NAMES}=)([^&#\s]+)",
     re.IGNORECASE,
 )
 
@@ -145,14 +161,26 @@ def redact_sensitive_text(text: str) -> str:
         return f"{name}={quote}{_mask_token(value)}{quote}"
     text = _ENV_ASSIGN_RE.sub(_redact_env, text)
 
-    # JSON fields: "apiKey": "value"
+    # JSON fields: "apiKey": "***"
     def _redact_json(m):
         key, value = m.group(1), m.group(2)
         return f'{key}: "{_mask_token(value)}"'
     text = _JSON_FIELD_RE.sub(_redact_json, text)
 
+    # Python dict / repr fields: {'api_key': '***'}
+    def _redact_python_field(m):
+        key, value = m.group(1), m.group(2)
+        return f"{key}: '{_mask_token(value)}'"
+    text = _PYTHON_FIELD_RE.sub(_redact_python_field, text)
+
     # Authorization headers
     text = _AUTH_HEADER_RE.sub(
+        lambda m: m.group(1) + _mask_token(m.group(2)),
+        text,
+    )
+
+    # Secret-bearing URL query params
+    text = _QUERY_PARAM_RE.sub(
         lambda m: m.group(1) + _mask_token(m.group(2)),
         text,
     )

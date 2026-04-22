@@ -28,6 +28,21 @@ ROLE_MAX_AUTO_RISK = {
 }
 ACTIVE_RUN_STATUSES = {"queued", "running", "paused", "blocked", "pending_approval"}
 TERMINAL_RUN_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
+PRIVATE_CHAT_TYPES = {
+    "dm",
+    "direct",
+    "direct_message",
+    "private",
+    "im",
+    "1:1",
+    "1",
+    "p2p",
+    "single",
+    "singlechat",
+}
+ALLOWED_USER_MEMORY_SCOPES = {"profile", "notes", "distilled"}
+ALLOWED_TASK_MEMORY_SCOPES = {"shared"}
 
 
 def db_path() -> Path:
@@ -51,6 +66,170 @@ def _new_trace_id() -> str:
 def _normalize_trace_id(value: Any) -> str:
     normalized = str(value or "").strip()
     return normalized or _new_trace_id()
+
+
+def _session_env_value(name: str) -> str:
+    try:
+        from gateway.session_context import get_session_env
+
+        return str(get_session_env(name) or "").strip()
+    except Exception:
+        return ""
+
+
+def _current_memory_session_context() -> Dict[str, str]:
+    return {
+        "platform": _session_env_value("HERMES_SESSION_PLATFORM").lower(),
+        "chat_id": _session_env_value("HERMES_SESSION_CHAT_ID"),
+        "thread_id": _session_env_value("HERMES_SESSION_THREAD_ID"),
+        "chat_type": _session_env_value("HERMES_SESSION_CHAT_TYPE").lower(),
+        "user_id": _session_env_value("HERMES_SESSION_USER_ID"),
+        "session_key": _session_env_value("HERMES_SESSION_KEY"),
+    }
+
+
+def _attach_memory_governance(
+    *,
+    payload: Optional[Dict[str, Any]],
+    memory_kind: str,
+    scope: str,
+    owner_ref: str,
+    governance_ref: str,
+) -> Dict[str, Any]:
+    memory = dict(payload or {})
+    existing = memory.get("governance") if isinstance(memory.get("governance"), dict) else {}
+    session = _current_memory_session_context()
+    memory["governance"] = {
+        **existing,
+        "policy_version": 1,
+        "memory_kind": memory_kind,
+        "scope": str(scope or "").strip(),
+        "owner_ref": str(owner_ref or "").strip(),
+        "governance_ref": str(governance_ref or "").strip(),
+        "writer": "business_db",
+        "updated_at_unix": _now(),
+        "session": {
+            "platform": session.get("platform", ""),
+            "chat_id": session.get("chat_id", ""),
+            "thread_id": session.get("thread_id", ""),
+            "chat_type": session.get("chat_type", ""),
+            "user_id": session.get("user_id", ""),
+            "session_key": session.get("session_key", ""),
+        },
+    }
+    return memory
+
+
+def _validate_user_memory_write(*, platform: str, user_id: str, scope: str) -> None:
+    normalized_scope = str(scope or "profile").strip().lower() or "profile"
+    if normalized_scope not in ALLOWED_USER_MEMORY_SCOPES:
+        allowed = ", ".join(sorted(ALLOWED_USER_MEMORY_SCOPES))
+        raise ValueError(f"user memory scope '{normalized_scope}' is not allowed; allowed scopes: {allowed}")
+
+    session = _current_memory_session_context()
+    session_platform = session.get("platform", "")
+    session_chat_type = session.get("chat_type", "")
+    session_user_id = session.get("user_id", "")
+    if not session_platform and not session_chat_type and not session_user_id:
+        return
+
+    if normalized_scope in {"profile", "notes"}:
+        if session_chat_type not in PRIVATE_CHAT_TYPES:
+            raise ValueError("person memory writes require a private 1:1 conversation")
+        if session_platform and session_platform != str(platform or "").strip().lower():
+            raise ValueError("person memory writes cannot cross platform boundaries")
+        if session_user_id and session_user_id != str(user_id or "").strip():
+            raise ValueError("person memory writes cannot target another user in the current session")
+
+
+def _validate_task_memory_write(*, task_id: str, scope: str) -> None:
+    normalized_scope = str(scope or "shared").strip().lower() or "shared"
+    if normalized_scope not in ALLOWED_TASK_MEMORY_SCOPES:
+        allowed = ", ".join(sorted(ALLOWED_TASK_MEMORY_SCOPES))
+        raise ValueError(f"task memory scope '{normalized_scope}' is not allowed; allowed scopes: {allowed}")
+
+    session = _current_memory_session_context()
+    session_platform = session.get("platform", "")
+    session_chat_id = session.get("chat_id", "")
+    session_thread_id = session.get("thread_id", "")
+    session_chat_type = session.get("chat_type", "")
+    if not session_platform or not session_chat_id:
+        return
+
+    bound_task = get_channel_task(platform=session_platform, chat_id=session_chat_id, thread_id=session_thread_id)
+    bound = (bound_task or {}).get("task") if isinstance(bound_task, dict) else None
+    bound_task_id = str((bound or {}).get("task_id") or "").strip()
+    if session_chat_type in PRIVATE_CHAT_TYPES:
+        if bound_task_id and bound_task_id != str(task_id or "").strip():
+            raise ValueError("task memory write does not match the task bound to the current private conversation")
+        return
+    if not bound_task_id:
+        raise ValueError("shared-chat task memory writes require the current chat to be bound to a task")
+    if bound_task_id != str(task_id or "").strip():
+        raise ValueError("task memory write does not match the task bound to the current chat")
+
+
+def _validate_distilled_profile_mutation(
+    *,
+    platform: str,
+    user_id: str,
+    actor_user_id: str = "",
+    allow_cross_user: bool = False,
+    action: str = "",
+) -> None:
+    session = _current_memory_session_context()
+    session_platform = session.get("platform", "")
+    session_chat_type = session.get("chat_type", "")
+    session_user_id = session.get("user_id", "")
+    if not session_platform and not session_chat_type and not session_user_id:
+        return
+
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_user_id = str(user_id or "").strip()
+    normalized_actor_user_id = str(actor_user_id or "").strip()
+    if session_platform and normalized_platform and session_platform != normalized_platform:
+        raise ValueError("distilled profile mutations cannot cross platform boundaries")
+    if session_chat_type and session_chat_type not in PRIVATE_CHAT_TYPES:
+        raise ValueError("distilled profile mutations require a private 1:1 conversation")
+
+    effective_actor_user_id = normalized_actor_user_id or session_user_id
+    if effective_actor_user_id and effective_actor_user_id != normalized_user_id and not allow_cross_user:
+        action_label = str(action or "mutation").strip() or "mutation"
+        raise ValueError(f"distilled profile {action_label} cannot target another user without profile management permission")
+
+
+def _build_distilled_governance(
+    *,
+    existing_memory: Optional[Dict[str, Any]],
+    platform: str,
+    user_id: str,
+    action: str,
+    actor: str,
+    allow_cross_user: bool = False,
+) -> Dict[str, Any]:
+    normalized = _normalize_distilled_memory(existing_memory)
+    governance = dict(normalized.get("governance") or {})
+    session = _current_memory_session_context()
+    governance.update(
+        {
+            "memory_kind": "person",
+            "scope": "distilled",
+            "owner_ref": f"{str(platform or '').strip().lower()}:user:{str(user_id or '').strip()}",
+            "last_action": str(action or "").strip(),
+            "last_actor": str(actor or "").strip(),
+            "last_action_at_unix": _now(),
+            "cross_user_override": bool(allow_cross_user),
+            "write_context": {
+                "platform": session.get("platform", ""),
+                "chat_id": session.get("chat_id", ""),
+                "thread_id": session.get("thread_id", ""),
+                "chat_type": session.get("chat_type", ""),
+                "user_id": session.get("user_id", ""),
+                "session_key": session.get("session_key", ""),
+            },
+        }
+    )
+    return governance
 
 
 def connect() -> sqlite3.Connection:
@@ -156,6 +335,7 @@ def initialize_database(conn: Optional[sqlite3.Connection] = None) -> None:
             CREATE TABLE IF NOT EXISTS background_jobs (
                 job_id TEXT PRIMARY KEY,
                 trace_id TEXT NOT NULL DEFAULT '',
+                task_id TEXT NOT NULL DEFAULT '',
                 title TEXT NOT NULL DEFAULT '',
                 prompt TEXT NOT NULL DEFAULT '',
                 status TEXT NOT NULL DEFAULT '',
@@ -352,6 +532,7 @@ def initialize_database(conn: Optional[sqlite3.Connection] = None) -> None:
             """
         )
         _ensure_column(conn, "background_jobs", "trace_id", "TEXT NOT NULL DEFAULT ''")
+        _ensure_column(conn, "background_jobs", "task_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "background_job_events", "trace_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "capability_runs", "trace_id", "TEXT NOT NULL DEFAULT ''")
         _ensure_column(conn, "capability_artifacts", "trace_id", "TEXT NOT NULL DEFAULT ''")
@@ -946,6 +1127,7 @@ def _normalize_distilled_memory(memory: Optional[Dict[str, Any]]) -> Dict[str, A
     nested_draft_sources = nested_draft.get("sources") if isinstance(nested_draft.get("sources"), dict) else {}
     manual_overrides = payload.get("manual_overrides") if isinstance(payload.get("manual_overrides"), dict) else {}
     locked_fields = payload.get("locked_fields") if isinstance(payload.get("locked_fields"), list) else []
+    governance = payload.get("governance") if isinstance(payload.get("governance"), dict) else {}
     raw_history = payload.get("history") if isinstance(payload.get("history"), list) else []
     history: list[Dict[str, Any]] = []
     for item in raw_history[:_DISTILLED_HISTORY_LIMIT]:
@@ -985,6 +1167,7 @@ def _normalize_distilled_memory(memory: Optional[Dict[str, Any]]) -> Dict[str, A
         "sources": sources,
         "manual_overrides": {str(key).strip(): value for key, value in manual_overrides.items() if str(key).strip()},
         "locked_fields": sorted({str(item).strip() for item in locked_fields if str(item).strip()}),
+        "governance": dict(governance),
         "history": history,
         "generated_at_unix": int(payload.get("generated_at_unix") or 0),
         "updated_by": str(payload.get("updated_by") or "").strip(),
@@ -1036,6 +1219,7 @@ def _distilled_payload_from_normalized(normalized: Dict[str, Any]) -> Dict[str, 
         "sources": dict(normalized.get("sources") or {}),
         "manual_overrides": dict(normalized.get("manual_overrides") or {}),
         "locked_fields": list(normalized.get("locked_fields") or []),
+        "governance": dict(normalized.get("governance") or {}),
         "history": list(normalized.get("history") or []),
         "generated_at_unix": int(normalized.get("generated_at_unix") or 0),
         "updated_by": str(normalized.get("updated_by") or "").strip(),
@@ -1085,18 +1269,29 @@ def _append_distilled_history(
 
 
 def upsert_user_memory(*, platform: str, user_id: str, scope: str = "profile", summary: str = "", memory: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_user_id = str(user_id or "").strip()
+    normalized_scope = str(scope or "profile").strip().lower() or "profile"
+    _validate_user_memory_write(platform=normalized_platform, user_id=normalized_user_id, scope=normalized_scope)
     user = upsert_user(platform=platform, user_id=user_id, mark_seen=False)
     user_key = str(user.get("user_key") or "").strip()
     if not user_key:
         raise ValueError("user_key is required")
     now = _now()
-    memory_key = _memory_key("user-memory", user_key, scope)
+    memory_key = _memory_key("user-memory", user_key, normalized_scope)
+    governed_memory = _attach_memory_governance(
+        payload=memory,
+        memory_kind="person",
+        scope=normalized_scope,
+        owner_ref=f"{normalized_platform}:user:{normalized_user_id}",
+        governance_ref=f"user-memory:{user_key}:{normalized_scope}",
+    )
     record = {
         "memory_key": memory_key,
         "user_key": user_key,
-        "scope": str(scope or "profile").strip().lower() or "profile",
+        "scope": normalized_scope,
         "summary": str(summary or "").strip(),
-        "memory": memory or {},
+        "memory": governed_memory,
         "created_at_unix": now,
         "updated_at_unix": now,
     }
@@ -1121,7 +1316,7 @@ def upsert_user_memory(*, platform: str, user_id: str, scope: str = "profile", s
             ),
         )
         conn.commit()
-    return get_user_memory(platform=platform, user_id=user_id, scope=scope) or {}
+    return get_user_memory(platform=platform, user_id=user_id, scope=normalized_scope) or {}
 
 
 def get_user_memory(*, platform: str, user_id: str, scope: str = "profile") -> Optional[Dict[str, Any]]:
@@ -1156,6 +1351,7 @@ def upsert_user_distilled_profile(
     manual_overrides: Optional[Dict[str, Any]] = None,
     locked_fields: Optional[Iterable[str]] = None,
     updated_by: str = "",
+    governance: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     if any(value is not None for value in (profile, evidence, sources, manual_overrides, locked_fields)):
         existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
@@ -1190,6 +1386,7 @@ def upsert_user_distilled_profile(
             "sources": sources or existing_memory.get("sources") or {},
             "manual_overrides": final_manual_overrides,
             "locked_fields": sorted(final_locked_fields),
+            "governance": dict(governance or existing_memory.get("governance") or {}),
             "history": list(existing_memory.get("history") or []),
             "generated_at_unix": _now(),
             "updated_by": str(updated_by or "distiller").strip() or "distiller",
@@ -1207,7 +1404,10 @@ def upsert_user_distilled_profile(
         user_id=user_id,
         scope="distilled",
         summary=summary,
-        memory=memory,
+        memory={
+            **(memory or {}),
+            "governance": dict(governance or ((memory or {}).get("governance") if isinstance(memory, dict) else {}) or {}),
+        },
     )
 
 
@@ -1247,6 +1447,14 @@ def save_user_distilled_profile_draft(
 ) -> Dict[str, Any]:
     existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
     normalized = _normalize_distilled_memory(existing.get("memory") if isinstance(existing, dict) else None)
+    normalized["governance"] = _build_distilled_governance(
+        existing_memory=existing.get("memory") if isinstance(existing, dict) else None,
+        platform=platform,
+        user_id=user_id,
+        action="draft_saved",
+        actor=str(updated_by or "distiller").strip() or "distiller",
+        allow_cross_user=False,
+    )
     normalized["draft"] = {
         "summary": str(summary or "").strip() or _build_distilled_summary(profile or {}),
         "profile": dict(profile or {}),
@@ -1280,7 +1488,16 @@ def publish_user_distilled_profile_draft(
     platform: str,
     user_id: str,
     published_by: str = "",
+    actor_user_id: str = "",
+    allow_cross_user: bool = False,
 ) -> Dict[str, Any]:
+    _validate_distilled_profile_mutation(
+        platform=platform,
+        user_id=user_id,
+        actor_user_id=actor_user_id or published_by,
+        allow_cross_user=allow_cross_user,
+        action="publish",
+    )
     existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
     normalized = _normalize_distilled_memory(existing.get("memory") if isinstance(existing, dict) else None)
     draft = normalized.get("draft") if isinstance(normalized, dict) else None
@@ -1296,6 +1513,14 @@ def publish_user_distilled_profile_draft(
         manual_overrides=dict(normalized.get("manual_overrides") or {}),
         locked_fields=list(normalized.get("locked_fields") or []),
         updated_by=str(published_by or "profile_publish").strip() or "profile_publish",
+        governance=_build_distilled_governance(
+            existing_memory=existing.get("memory") if isinstance(existing, dict) else None,
+            platform=platform,
+            user_id=user_id,
+            action="published",
+            actor=str(published_by or actor_user_id or "profile_publish").strip() or "profile_publish",
+            allow_cross_user=allow_cross_user,
+        ),
     )
     published = _append_distilled_history(
         platform=platform,
@@ -1312,6 +1537,9 @@ def publish_user_distilled_profile_draft(
         platform=platform,
         user_id=user_id,
         discarded_by=str(published_by or "profile_publish").strip() or "profile_publish",
+        actor_user_id=actor_user_id,
+        allow_cross_user=allow_cross_user,
+        update_governance=False,
     ) if isinstance(published, dict) else published
 
 
@@ -1320,10 +1548,29 @@ def discard_user_distilled_profile_draft(
     platform: str,
     user_id: str,
     discarded_by: str = "",
+    actor_user_id: str = "",
+    allow_cross_user: bool = False,
+    update_governance: bool = True,
 ) -> Dict[str, Any]:
+    _validate_distilled_profile_mutation(
+        platform=platform,
+        user_id=user_id,
+        actor_user_id=actor_user_id or discarded_by,
+        allow_cross_user=allow_cross_user,
+        action="discard",
+    )
     existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
     normalized = _normalize_distilled_memory(existing.get("memory") if isinstance(existing, dict) else None)
     had_draft = bool((normalized.get("draft") or {}).get("profile") or (normalized.get("draft") or {}).get("summary"))
+    if update_governance:
+        normalized["governance"] = _build_distilled_governance(
+            existing_memory=existing.get("memory") if isinstance(existing, dict) else None,
+            platform=platform,
+            user_id=user_id,
+            action="draft_discarded",
+            actor=str(discarded_by or actor_user_id or "profile_discard").strip() or "profile_discard",
+            allow_cross_user=allow_cross_user,
+        )
     normalized["draft"] = {
         "summary": "",
         "profile": {},
@@ -1358,7 +1605,16 @@ def set_user_distilled_profile_overrides(
     user_id: str,
     overrides: Optional[Dict[str, Any]] = None,
     locked_fields: Optional[Iterable[str]] = None,
+    actor_user_id: str = "",
+    allow_cross_user: bool = False,
 ) -> Dict[str, Any]:
+    _validate_distilled_profile_mutation(
+        platform=platform,
+        user_id=user_id,
+        actor_user_id=actor_user_id or "manual_override",
+        allow_cross_user=allow_cross_user,
+        action="override",
+    )
     existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
     normalized = _normalize_distilled_memory(existing.get("memory") if isinstance(existing, dict) else None)
     final_manual = dict(normalized.get("manual_overrides") or {})
@@ -1376,6 +1632,14 @@ def set_user_distilled_profile_overrides(
         manual_overrides=final_manual,
         locked_fields=sorted(final_locked),
         updated_by="manual_override",
+        governance=_build_distilled_governance(
+            existing_memory=existing.get("memory") if isinstance(existing, dict) else None,
+            platform=platform,
+            user_id=user_id,
+            action="override_set",
+            actor=str(actor_user_id or "manual_override").strip() or "manual_override",
+            allow_cross_user=allow_cross_user,
+        ),
     )
     return _append_distilled_history(
         platform=platform,
@@ -1395,7 +1659,16 @@ def clear_user_distilled_profile_override(
     user_id: str,
     field: str,
     unlock: bool = True,
+    actor_user_id: str = "",
+    allow_cross_user: bool = False,
 ) -> Dict[str, Any]:
+    _validate_distilled_profile_mutation(
+        platform=platform,
+        user_id=user_id,
+        actor_user_id=actor_user_id or "manual_override",
+        allow_cross_user=allow_cross_user,
+        action="unlock" if unlock else "override_clear",
+    )
     normalized_field = str(field or "").strip()
     existing = get_user_distilled_profile(platform=platform, user_id=user_id) or {}
     normalized = _normalize_distilled_memory(existing.get("memory") if isinstance(existing, dict) else None)
@@ -1414,6 +1687,14 @@ def clear_user_distilled_profile_override(
         manual_overrides=final_manual,
         locked_fields=sorted(final_locked),
         updated_by="manual_override",
+        governance=_build_distilled_governance(
+            existing_memory=existing.get("memory") if isinstance(existing, dict) else None,
+            platform=platform,
+            user_id=user_id,
+            action="override_cleared",
+            actor=str(actor_user_id or "manual_override").strip() or "manual_override",
+            allow_cross_user=allow_cross_user,
+        ),
     )
     return _append_distilled_history(
         platform=platform,
@@ -1594,6 +1875,55 @@ def list_tasks(status: str = "", limit: int = 20) -> list[Dict[str, Any]]:
     ]
 
 
+def update_task(task_id: str, **fields: Any) -> Optional[Dict[str, Any]]:
+    current = get_task(task_id)
+    if not current:
+        return None
+    allowed = {
+        "title",
+        "goal",
+        "status",
+        "owner_user_id",
+        "source_platform",
+        "source_chat_id",
+        "source_thread_id",
+        "source_session_id",
+        "metadata",
+        "started_at_unix",
+        "finished_at_unix",
+    }
+    updates = {key: value for key, value in fields.items() if key in allowed and value is not None}
+    if not updates:
+        return current
+
+    normalized_status = str(updates.get("status") or "").strip().lower()
+    if normalized_status:
+        updates["status"] = normalized_status
+        if normalized_status in {"running", "queued", "pending_approval", "blocked", "paused"} and not current.get("started_at_unix"):
+            updates["started_at_unix"] = _now()
+        if normalized_status in {"completed", "failed", "cancelled"} and not current.get("finished_at_unix"):
+            updates["finished_at_unix"] = _now()
+
+    assignments: list[str] = []
+    values: list[Any] = []
+    for key, value in updates.items():
+        column = "metadata_json" if key == "metadata" else key
+        assignments.append(f"{column}=?")
+        if key == "metadata":
+            values.append(_json(value if isinstance(value, dict) else {}))
+        elif key in {"started_at_unix", "finished_at_unix"}:
+            values.append(value)
+        else:
+            values.append(str(value))
+    assignments.append("updated_at_unix=?")
+    values.append(_now())
+    values.append(task_id)
+    with connect() as conn:
+        conn.execute(f"UPDATE tasks SET {', '.join(assignments)} WHERE task_id=?", values)
+        conn.commit()
+    return get_task(task_id)
+
+
 def list_tasks_for_user(
     *,
     platform: str,
@@ -1631,6 +1961,118 @@ def list_tasks_for_user(
         }
         for row in rows
     ]
+
+
+def _find_latest_task_for_source(
+    *,
+    source_platform: str,
+    source_chat_id: str,
+    source_thread_id: str = "",
+    source_session_id: str = "",
+) -> Optional[Dict[str, Any]]:
+    normalized_platform = str(source_platform or "").strip().lower()
+    normalized_chat_id = str(source_chat_id or "").strip()
+    normalized_thread_id = str(source_thread_id or "").strip()
+    normalized_session_id = str(source_session_id or "").strip()
+    if not normalized_platform or not normalized_chat_id:
+        return None
+    query = """
+        SELECT task_id
+        FROM tasks
+        WHERE source_platform=?
+          AND source_chat_id=?
+          AND source_thread_id=?
+          AND status NOT IN (?, ?, ?)
+    """
+    params: list[Any] = [
+        normalized_platform,
+        normalized_chat_id,
+        normalized_thread_id,
+        "completed",
+        "failed",
+        "cancelled",
+    ]
+    if normalized_session_id:
+        query += " AND (source_session_id=? OR source_session_id='')"
+        params.append(normalized_session_id)
+    query += " ORDER BY updated_at_unix DESC, created_at_unix DESC LIMIT 1"
+    with connect() as conn:
+        row = conn.execute(query, params).fetchone()
+    if not row:
+        return None
+    return get_task(str(row["task_id"] or "").strip())
+
+
+def _ensure_task_for_origin(
+    *,
+    task_id: str = "",
+    title: str = "",
+    goal: str = "",
+    actor_user_id: str = "",
+    session_id: str = "",
+    origin: Optional[Dict[str, Any]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> str:
+    explicit = _normalize_task_id(task_id)
+    if explicit:
+        return explicit
+    origin = origin if isinstance(origin, dict) else {}
+    platform = str(origin.get("platform") or "").strip().lower()
+    chat_id = str(origin.get("chat_id") or "").strip()
+    thread_id = str(origin.get("thread_id") or "").strip()
+    if not platform or not chat_id:
+        return ""
+
+    bound = get_channel_task(platform=platform, chat_id=chat_id, thread_id=thread_id)
+    bound_task = bound.get("task") if isinstance(bound, dict) else None
+    bound_task_id = _normalize_task_id((bound_task or {}).get("task_id") or "")
+    if bound_task_id:
+        return bound_task_id
+
+    existing = _find_latest_task_for_source(
+        source_platform=platform,
+        source_chat_id=chat_id,
+        source_thread_id=thread_id,
+        source_session_id=session_id,
+    )
+    if existing:
+        existing_task_id = _normalize_task_id(existing.get("task_id") or "")
+        if existing_task_id:
+            upsert_channel(
+                platform=platform,
+                chat_id=chat_id,
+                thread_id=thread_id,
+                task_id=existing_task_id,
+                chat_name=str(origin.get("chat_name") or "").strip(),
+                chat_type=str(origin.get("chat_type") or "").strip(),
+            )
+            return existing_task_id
+
+    created = create_task(
+        title=str(title or goal or "").strip(),
+        goal=str(goal or title or "").strip(),
+        owner_user_id=str(actor_user_id or "").strip(),
+        source_platform=platform,
+        source_chat_id=chat_id,
+        source_thread_id=thread_id,
+        source_session_id=str(session_id or "").strip(),
+        metadata={
+            "auto_materialized": True,
+            "origin": origin,
+            **(metadata or {}),
+        },
+    )
+    created_task_id = _normalize_task_id(created.get("task_id") or "")
+    if created_task_id:
+        upsert_channel(
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+            task_id=created_task_id,
+            chat_name=str(origin.get("chat_name") or "").strip(),
+            chat_type=str(origin.get("chat_type") or "").strip(),
+        )
+    return created_task_id
 
 
 def bind_channel_task(*, platform: str, chat_id: str, thread_id: str = "", task_id: str) -> Dict[str, Any]:
@@ -1684,14 +2126,23 @@ def upsert_task_memory(*, task_id: str, scope: str = "shared", summary: str = ""
     task = get_task(task_id)
     if not task:
         raise ValueError("task not found")
+    normalized_scope = str(scope or "shared").strip().lower() or "shared"
+    _validate_task_memory_write(task_id=task_id, scope=normalized_scope)
     now = _now()
-    memory_key = _memory_key("task-memory", task_id, scope)
+    memory_key = _memory_key("task-memory", task_id, normalized_scope)
+    governed_memory = _attach_memory_governance(
+        payload=memory,
+        memory_kind="task",
+        scope=normalized_scope,
+        owner_ref=f"task:{task_id}",
+        governance_ref=f"task-memory:{task_id}:{normalized_scope}",
+    )
     record = {
         "memory_key": memory_key,
         "task_id": task_id,
-        "scope": str(scope or "shared").strip().lower() or "shared",
+        "scope": normalized_scope,
         "summary": str(summary or "").strip(),
-        "memory": memory or {},
+        "memory": governed_memory,
         "created_at_unix": now,
         "updated_at_unix": now,
     }
@@ -1716,7 +2167,7 @@ def upsert_task_memory(*, task_id: str, scope: str = "shared", summary: str = ""
             ),
         )
         conn.commit()
-    return get_task_memory(task_id=task_id, scope=scope) or {}
+    return get_task_memory(task_id=task_id, scope=normalized_scope) or {}
 
 
 def get_task_memory(*, task_id: str, scope: str = "shared") -> Optional[Dict[str, Any]]:
@@ -1895,6 +2346,10 @@ def decide_approval(approval_id: str, *, status: str, approved_by: str = "") -> 
         row = conn.execute("SELECT * FROM approvals WHERE approval_id=?", (approval_id,)).fetchone()
         if not row:
             return None
+        target_task_id = ""
+        payload = _safe_json_loads(row["payload_json"], {})
+        if isinstance(payload, dict):
+            target_task_id = _normalize_task_id(payload.get("task_id") or "")
         conn.execute(
             "UPDATE approvals SET status=?, approved_by=?, decided_at_unix=? WHERE approval_id=?",
             (normalized, str(approved_by or "").strip(), _now(), approval_id),
@@ -1922,6 +2377,16 @@ def decide_approval(approval_id: str, *, status: str, approved_by: str = "") -> 
                     (approval_id, _now(), _now(), row["target_id"]),
                 )
         conn.commit()
+    if not target_task_id and row["kind"] == "capability_run":
+        run = get_capability_run(str(row["target_id"] or "").strip())
+        target_task_id = _normalize_task_id((run or {}).get("task_id") or "")
+    if target_task_id:
+        try:
+            from agent.task_panel_service import sync_task_control_state
+
+            sync_task_control_state(target_task_id)
+        except Exception:
+            pass
     return next((item for item in list_approvals(status="", limit=200) if item["approval_id"] == approval_id), None)
 
 
@@ -1929,6 +2394,7 @@ def _background_job_from_row(row: sqlite3.Row) -> Dict[str, Any]:
     return {
         "job_id": row["job_id"],
         "trace_id": row["trace_id"],
+        "task_id": row["task_id"],
         "title": row["title"],
         "prompt": row["prompt"],
         "status": row["status"],
@@ -1964,15 +2430,16 @@ def upsert_background_job(record: Dict[str, Any]) -> None:
         conn.execute(
             """
             INSERT INTO background_jobs(
-                job_id, trace_id, title, prompt, status, priority, tags_json, origin_json,
+                job_id, trace_id, task_id, title, prompt, status, priority, tags_json, origin_json,
                 session_id, user_id, created_at_unix, updated_at_unix, started_at_unix,
                 finished_at_unix, current_focus, next_step, blocker, result,
                 artifact_paths_json, job_dir, events_path, executor, delivery_status,
                 delivery_error, delivery_target, delivered_at_unix
             )
-            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(job_id) DO UPDATE SET
                 trace_id=excluded.trace_id,
+                task_id=excluded.task_id,
                 title=excluded.title,
                 prompt=excluded.prompt,
                 status=excluded.status,
@@ -2001,6 +2468,7 @@ def upsert_background_job(record: Dict[str, Any]) -> None:
             (
                 job_id,
                 _normalize_trace_id(record.get("trace_id")),
+                str(record.get("task_id") or ""),
                 str(record.get("title") or ""),
                 str(record.get("prompt") or ""),
                 str(record.get("status") or ""),
@@ -2203,6 +2671,19 @@ def create_capability_run(
     origin = origin or {}
     input_data = input_data or {}
     resolved_task_id = _resolve_task_id(task_id, origin)
+    if not resolved_task_id:
+        resolved_task_id = _ensure_task_for_origin(
+            task_id=task_id,
+            title=title,
+            goal=goal,
+            actor_user_id=actor_user_id,
+            session_id=session_id,
+            origin=origin,
+            metadata={
+                "materialized_by": "create_capability_run",
+                "capability": str(capability or "").strip(),
+            },
+        )
     trace_id = _normalize_trace_id(
         input_data.get("trace_id")
         if isinstance(input_data, dict)
@@ -2362,6 +2843,13 @@ def create_capability_run(
                 "task_id": resolved_task_id,
             },
         )
+        if resolved_task_id:
+            try:
+                from agent.task_panel_service import sync_task_control_state
+
+                sync_task_control_state(resolved_task_id)
+            except Exception:
+                pass
         return record
     finally:
         if ops_lock_acquired:
@@ -2463,6 +2951,7 @@ def update_capability_run(run_id: str, **fields: Any) -> Optional[Dict[str, Any]
         return None
     allowed = {
         "status",
+        "task_id",
         "priority",
         "background_job_id",
         "approval_id",
@@ -2495,7 +2984,16 @@ def update_capability_run(run_id: str, **fields: Any) -> Optional[Dict[str, Any]
     with connect() as conn:
         conn.execute(f"UPDATE capability_runs SET {', '.join(assignments)} WHERE run_id=?", values)
         conn.commit()
-    return get_capability_run(run_id)
+    updated = get_capability_run(run_id)
+    resolved_task_id = str((updated or {}).get("task_id") or current.get("task_id") or "").strip()
+    if resolved_task_id:
+        try:
+            from agent.task_panel_service import sync_task_control_state
+
+            sync_task_control_state(resolved_task_id)
+        except Exception:
+            pass
+    return updated
 
 
 def add_capability_step(

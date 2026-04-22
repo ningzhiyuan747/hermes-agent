@@ -124,3 +124,26 @@ def test_unbound_group_memory_write_is_rejected(tmp_path, monkeypatch):
 
     assert result["success"] is False
     assert "requires a bound task" in result["error"]
+
+
+def test_system_memory_write_bypasses_scoped_routing(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    session = {
+        "HERMES_SESSION_PLATFORM": "dingtalk",
+        "HERMES_SESSION_CHAT_TYPE": "group",
+        "HERMES_SESSION_USER_ID": "staff_4",
+        "HERMES_SESSION_CHAT_ID": "cid_group_4",
+        "HERMES_SESSION_THREAD_ID": "",
+    }
+    called = {"user": 0, "task": 0}
+
+    monkeypatch.setattr(memory_mod, "_get_session_env", lambda name, default="": session.get(name, default))
+    monkeypatch.setattr(memory_mod, "_get_bound_task_id", lambda *_args, **_kwargs: "task-789")
+    monkeypatch.setattr(business_db, "upsert_user_memory", lambda **kwargs: called.__setitem__("user", called["user"] + 1))
+    monkeypatch.setattr(business_db, "upsert_task_memory", lambda **kwargs: called.__setitem__("task", called["task"] + 1))
+
+    result = json.loads(memory_mod.memory_tool(action="add", target="system", content="Canonical workspace is F:\\hermes-dingtalk-bridge", store=store))
+
+    assert result["success"] is True
+    assert called["user"] == 0
+    assert called["task"] == 0

@@ -93,6 +93,12 @@ class TestResolveCommand:
     def test_canonical_name_resolves(self):
         assert resolve_command("help").name == "help"
         assert resolve_command("background").name == "background"
+        assert resolve_command("task-board").name == "task-board"
+        assert resolve_command("control-tower").name == "control-tower"
+        assert resolve_command("active-tasks").name == "active-tasks"
+        assert resolve_command("pending-approvals").name == "pending-approvals"
+        assert resolve_command("retry-delivery").name == "retry-delivery"
+        assert resolve_command("follow-up").name == "follow-up"
 
     def test_alias_resolves_to_canonical(self):
         assert resolve_command("bg").name == "background"
@@ -102,6 +108,16 @@ class TestResolveCommand:
         assert resolve_command("gateway").name == "platforms"
         assert resolve_command("set-home").name == "sethome"
         assert resolve_command("reload_mcp").name == "reload-mcp"
+        assert resolve_command("tower").name == "control-tower"
+        assert resolve_command("secretary").name == "secretary-loop"
+        assert resolve_command("operator").name == "operator-worklist"
+        assert resolve_command("jobs").name == "job-status"
+        assert resolve_command("active").name == "active-tasks"
+        assert resolve_command("approvals").name == "pending-approvals"
+        assert resolve_command("blocked").name == "blocked-tasks"
+        assert resolve_command("failures").name == "recent-failures"
+        assert resolve_command("redeliver").name == "retry-delivery"
+        assert resolve_command("nudge").name == "follow-up"
 
     def test_leading_slash_stripped(self):
         assert resolve_command("/help").name == "help"

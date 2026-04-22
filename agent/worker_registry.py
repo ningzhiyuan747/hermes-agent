@@ -31,7 +31,7 @@ _WORKER_ROLES: Dict[str, WorkerRole] = {
             "Return handoffs in a boss-readable format with clear tradeoffs, risks, and the single best next move."
         ),
         default_toolsets=["terminal", "file", "web"],
-        memory_policy="No long-term worker memory. Use task-scoped notes and return a structured handoff to the parent.",
+        memory_policy="No long-term worker memory. Use task-scoped notes only, never write person/system memory directly, and return a structured handoff to the parent.",
         intended_contexts=["private leadership chat", "cross-domain planning", "priority setting", "decision synthesis"],
         capabilities=["prioritization", "decision framing", "cross-domain synthesis", "next-step selection"],
         task_slice_guidance=(
@@ -55,7 +55,7 @@ _WORKER_ROLES: Dict[str, WorkerRole] = {
             "Prefer structured outputs, source-oriented notes, missing-material checklists, and next-step recommendations."
         ),
         default_toolsets=["file", "web", "browser"],
-        memory_policy="No long-term worker memory. Keep task notes local and return a clean report with evidence and gaps.",
+        memory_policy="No long-term worker memory. Keep task notes local, never write person/system memory directly, and return a clean report with evidence and gaps.",
         intended_contexts=["bid research", "tender packages", "qualification review", "document collection"],
         capabilities=["tender research", "requirements extraction", "document checklisting", "source-backed evidence gathering"],
         task_slice_guidance=(
@@ -79,7 +79,7 @@ _WORKER_ROLES: Dict[str, WorkerRole] = {
             "When information is incomplete, identify what must be learned before pushing a recommendation."
         ),
         default_toolsets=["file", "web"],
-        memory_policy="No long-term worker memory. Use task-scoped notes only and hand back structured customer or market findings.",
+        memory_policy="No long-term worker memory. Use task-scoped notes only, never write person/system memory directly, and hand back structured customer or market findings.",
         intended_contexts=["customer research", "sales prep", "outreach drafting", "pipeline support"],
         capabilities=["customer research", "market context", "outreach preparation", "pipeline support"],
         task_slice_guidance=(
@@ -103,7 +103,7 @@ _WORKER_ROLES: Dict[str, WorkerRole] = {
             "When blocked, say exactly what failed, where, and what the next recovery step should be."
         ),
         default_toolsets=["terminal", "file", "web"],
-        memory_policy="No long-term worker memory. Use task-scoped notes and return reproducible findings and recovery steps.",
+        memory_policy="No long-term worker memory. Use task-scoped notes only, never write person/system memory directly, and return reproducible findings and recovery steps.",
         intended_contexts=["ops", "troubleshooting", "deployment", "runtime recovery"],
         capabilities=["runtime diagnosis", "log inspection", "service recovery", "deployment hygiene"],
         task_slice_guidance=(
@@ -127,7 +127,7 @@ _WORKER_ROLES: Dict[str, WorkerRole] = {
             "If the handoff is sound, say so briefly and name the residual risks. If it is weak, prioritize the few issues the parent must fix first."
         ),
         default_toolsets=["file", "web", "terminal"],
-        memory_policy="No long-term worker memory. Use task-scoped notes only and return validation findings to the parent.",
+        memory_policy="No long-term worker memory. Use task-scoped notes only, never write person/system memory directly, and return validation findings to the parent.",
         intended_contexts=["handoff review", "risk check", "evidence validation", "goal-drift detection"],
         capabilities=["adversarial review", "evidence checking", "risk discovery", "goal-drift detection"],
         task_slice_guidance=(

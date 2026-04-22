@@ -53,7 +53,25 @@ def test_format_task_panel_snapshot_includes_recent_artifacts_with_fullwidth_col
             },
         },
         "current_job": {"job_id": "job-42", "status": "active"},
+        "current_delegation": {
+            "worker_role": "ops-worker",
+            "status": "running",
+            "task_scope_key": "feishu:chat:group-42:thread:task-9",
+            "person_memory_key": "feishu:user:user-7",
+        },
         "approvals": [{"approval_id": "approval-1"}],
+        "control_summary": {
+            "status": "pending_approval",
+            "execution_status": "running",
+            "delivery_status": "pending",
+            "current_executor": "openclaw",
+            "current_focus": "正在搜合同公告",
+            "next_step": "等审批通过后继续抓附件",
+            "blocker": "Pending approval.",
+            "recovery_hint": "Resolve the pending approval before dispatch continues.",
+            "dispatch_action": "wait_approval",
+            "suggested_executor": "openclaw",
+        },
         "artifact_items": [
             {
                 "label": "合同PDF",
@@ -81,9 +99,20 @@ def test_format_task_panel_snapshot_includes_recent_artifacts_with_fullwidth_col
 
     assert "Task ID: task-123" in text
     assert "标题: 司羿中标合同取证" in text
+    assert "状态: pending_approval" in text
+    assert "当前执行器: openclaw" in text
     assert "当前 Run: contract_retrieval / running" in text
     assert "当前后台任务: job-42 / active" in text
+    assert "当前子代理: ops-worker / running" in text
     assert "待审批: 1" in text
+    assert "当前: 正在搜合同公告" in text
+    assert "下一步: 等审批通过后继续抓附件" in text
+    assert "阻塞: Pending approval." in text
+    assert "执行状态: running" in text
+    assert "投递状态: pending" in text
+    assert "恢复建议: Resolve the pending approval before dispatch continues." in text
+    assert "调度动作: wait_approval" in text
+    assert "建议执行器: openclaw" in text
     assert "Task scope： feishu:chat:group-42:thread:task-9" in text
     assert "Person memory： feishu:user:user-7" in text
     assert "Deliverable： 合同PDF -> 最终合同扫描件" in text

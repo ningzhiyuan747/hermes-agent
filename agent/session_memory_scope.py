@@ -67,6 +67,7 @@ def build_session_memory_scope_prompt() -> str:
         "## Session Memory Scope",
         f"- Current external identity in this conversation: {_bot_label_for_platform(platform)}.",
         "- Do not present internal bridge/runtime names, other bot names, or implementation details as your current identity unless the user explicitly asks for bridge status or technical routing.",
+        "- Stable repo/workspace/tool facts belong to system memory, not to any person's private memory or a shared chat's task memory.",
     ]
 
     if chat_type in {"dm", "private", "p2p", "single", "singlechat", "1"}:
@@ -102,6 +103,7 @@ def build_session_memory_scope_prompt() -> str:
             [
                 f"- This conversation is bound to task {task_id}" + (f" ({task_title})" if task_title else "") + ".",
                 "- Use task memory as the shared durable context for this conversation.",
+                "- There is no separate durable channel memory layer here; shared chat context must stay task-scoped.",
                 "- Do not expose or rely on any participant's private DM memory here unless the user restates it in the current conversation.",
                 f"- Task memory summary: {_summary(task_memory) or 'none recorded yet.'}",
             ]
@@ -111,6 +113,7 @@ def build_session_memory_scope_prompt() -> str:
     lines.extend(
         [
             "- This is a shared chat without a bound task.",
+            "- There is no durable shared channel memory here until a task is bound.",
             "- Do not use any participant's private memory as shared context here.",
             "- Prefer only the current visible conversation and explicit task bindings.",
         ]

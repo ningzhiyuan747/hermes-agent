@@ -12,6 +12,9 @@ import os
 import re
 import ssl
 import time
+import urllib.request
+from pathlib import Path
+from types import SimpleNamespace
 
 from agent.redact import redact_sensitive_text
 
@@ -20,6 +23,7 @@ logger = logging.getLogger(__name__)
 _TELEGRAM_TOPIC_TARGET_RE = re.compile(r"^\s*(-?\d+)(?::(\d+))?\s*$")
 _FEISHU_TARGET_RE = re.compile(r"^\s*((?:oc|ou|on|chat|open)_[-A-Za-z0-9]+)(?::([-A-Za-z0-9_]+))?\s*$")
 _WEIXIN_TARGET_RE = re.compile(r"^\s*((?:wxid|gh|v\d+|wm|wb)_[A-Za-z0-9_-]+|[A-Za-z0-9._-]+@chatroom|filehelper)\s*$")
+_DINGTALK_TARGET_RE = re.compile(r"^\s*(cid[-A-Za-z0-9+/=_]+)\s*$", re.IGNORECASE)
 # Discord snowflake IDs are numeric, same regex pattern as Telegram topic targets.
 _NUMERIC_TOPIC_RE = _TELEGRAM_TOPIC_TARGET_RE
 _IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".gif"}
@@ -34,6 +38,10 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     r"\b(access_token|api[_-]?key|auth[_-]?token|signature|sig)\s*=\s*([^\s,;]+)",
     re.IGNORECASE,
 )
+_DINGTALK_SHARED_ENV_CANDIDATES = (
+    Path("/mnt/f/hermes-dingtalk-bridge/.env"),
+    Path("/mnt/f/Desktop/爱马仕/.env"),
+)
 
 
 def _sanitize_error_text(text) -> str:
@@ -47,6 +55,33 @@ def _sanitize_error_text(text) -> str:
 def _error(message: str) -> dict:
     """Build a standardized error payload with redacted content."""
     return {"error": _sanitize_error_text(message)}
+
+
+def _read_env_value_from_file(path: Path, key: str) -> str:
+    try:
+        if not path.exists():
+            return ""
+        for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            current_key, value = line.split("=", 1)
+            if current_key.strip() == key:
+                return value.strip().strip("'\"")
+    except Exception:
+        return ""
+    return ""
+
+
+def _shared_dingtalk_credential(key: str) -> str:
+    direct = str(os.getenv(key) or "").strip()
+    if direct:
+        return direct
+    for path in _DINGTALK_SHARED_ENV_CANDIDATES:
+        value = _read_env_value_from_file(path, key)
+        if value:
+            return value
+    return ""
 
 
 def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
@@ -214,6 +249,11 @@ def _handle_send(args):
         return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
 
     pconfig = config.platforms.get(platform)
+    if (not pconfig or not pconfig.enabled) and platform == Platform.DINGTALK:
+        client_id = _shared_dingtalk_credential("DINGTALK_CLIENT_ID")
+        client_secret = _shared_dingtalk_credential("DINGTALK_CLIENT_SECRET")
+        if client_id and client_secret:
+            pconfig = SimpleNamespace(enabled=True, token=None, api_key=None, extra={"client_id": client_id, "client_secret": client_secret})
     if not pconfig or not pconfig.enabled:
         return tool_error(f"Platform '{platform_name}' is not configured. Set up credentials in ~/.hermes/config.yaml or environment variables.")
 
@@ -288,6 +328,10 @@ def _parse_target_ref(platform_name: str, target_ref: str):
             return match.group(1), match.group(2), True
     if platform_name == "weixin":
         match = _WEIXIN_TARGET_RE.fullmatch(target_ref)
+        if match:
+            return match.group(1), None, True
+    if platform_name == "dingtalk":
+        match = _DINGTALK_TARGET_RE.fullmatch(target_ref)
         if match:
             return match.group(1), None, True
     if target_ref.lstrip("-").isdigit():
@@ -1064,31 +1108,46 @@ async def _send_homeassistant(token, extra, chat_id, message):
 
 
 async def _send_dingtalk(extra, chat_id, message):
-    """Send via DingTalk robot webhook.
+    """Send via DingTalk official robot/oToMessages API using openConversationId."""
+    try:
+        if not chat_id:
+            return {"error": "Missing DingTalk chat_id"}
+        client_id = str((extra or {}).get("client_id") or _shared_dingtalk_credential("DINGTALK_CLIENT_ID")).strip()
+        client_secret = str((extra or {}).get("client_secret") or _shared_dingtalk_credential("DINGTALK_CLIENT_SECRET")).strip()
+        if not client_id or not client_secret:
+            return {"error": "DingTalk not configured. Set DINGTALK_CLIENT_ID and DINGTALK_CLIENT_SECRET."}
 
-    Note: The gateway's DingTalk adapter uses per-session webhook URLs from
-    incoming messages (dingtalk-stream SDK).  For cross-platform send_message
-    delivery we use a static robot webhook URL instead, which must be
-    configured via ``DINGTALK_WEBHOOK_URL`` env var or ``webhook_url`` in the
-    platform's extra config.
-    """
-    try:
-        import httpx
-    except ImportError:
-        return {"error": "httpx not installed"}
-    try:
-        webhook_url = extra.get("webhook_url") or os.getenv("DINGTALK_WEBHOOK_URL", "")
-        if not webhook_url:
-            return {"error": "DingTalk not configured. Set DINGTALK_WEBHOOK_URL env var or webhook_url in dingtalk platform extra config."}
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            resp = await client.post(
-                webhook_url,
-                json={"msgtype": "text", "text": {"content": message}},
+        def _post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:
+            data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            request = urllib.request.Request(
+                url,
+                data=data,
+                headers={"Content-Type": "application/json", **(headers or {})},
+                method="POST",
             )
-            resp.raise_for_status()
-            data = resp.json()
-            if data.get("errcode", 0) != 0:
-                return _error(f"DingTalk API error: {data.get('errmsg', 'unknown')}")
+            with urllib.request.urlopen(request, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+            return json.loads(raw) if raw else {}
+
+        token_data = await asyncio.to_thread(
+            _post_json,
+            "https://api.dingtalk.com/v1.0/oauth2/accessToken",
+            {"appKey": client_id, "appSecret": client_secret},
+        )
+        access_token = str(token_data.get("accessToken") or "").strip()
+        if not access_token:
+            return _error(f"DingTalk token response missing accessToken: {token_data}")
+        await asyncio.to_thread(
+            _post_json,
+            "https://api.dingtalk.com/v1.0/robot/oToMessages/batchSend",
+            {
+                "robotCode": client_id,
+                "openConversationId": chat_id,
+                "msgKey": "sampleText",
+                "msgParam": json.dumps({"content": message}, ensure_ascii=False),
+            },
+            {"x-acs-dingtalk-access-token": access_token},
+        )
         return {"success": True, "platform": "dingtalk", "chat_id": chat_id}
     except Exception as e:
         return _error(f"DingTalk send failed: {e}")

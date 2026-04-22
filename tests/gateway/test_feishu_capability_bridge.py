@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
-from gateway.platforms.feishu_capability_bridge import FeishuCapabilityBridge
+from gateway.platforms.feishu_capability_bridge import FeishuCapabilityBridge, FeishuCapabilityBridgeConfig
 
 
 def _make_event() -> SimpleNamespace:
@@ -73,3 +73,18 @@ def test_create_background_job_for_route_tags_and_output_include_scope_keys():
     assert update_kwargs["output"]["task_scope_key"] == "feishu:chat:group-42:thread:task-9"
     assert update_kwargs["output"]["person_memory_key"] == "feishu:user:user-7"
     assert update_kwargs["output"]["conversation_role"] == "chat_surface"
+
+
+def test_resolve_route_executor_keeps_allowed_research_route_on_openclaw():
+    bridge = FeishuCapabilityBridge(
+        FeishuCapabilityBridgeConfig(
+            offload_enabled=True,
+            offload_capabilities=frozenset({"bid_research", "contract_retrieval"}),
+        )
+    )
+
+    resolved = bridge.resolve_route_executor(
+        {"capability": "contract_retrieval", "executor": "openclaw", "worker_kind": "research"}
+    )
+
+    assert resolved["key"] == "openclaw"

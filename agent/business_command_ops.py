@@ -442,19 +442,28 @@ def execute_distilled_profile_command(
                 platform=message.platform,
                 user_id=target_user_id,
                 published_by=message.user_id or "profile_publish",
+                actor_user_id=message.user_id or "",
+                allow_cross_user=bool((not is_self) and can_manage_profiles),
             )
-        except ValueError:
-            return "当前没有待发布的画像草稿。"
+        except ValueError as exc:
+            if "distilled draft is empty" in str(exc):
+                return "当前没有待发布的画像草稿。"
+            return str(exc)
         return "已发布画像草稿。\n" + _format_distilled_profile(message.platform, target_user_id, record)
 
     if action == "discard-draft":
         if not is_self and not can_manage_profiles:
             return "丢弃他人画像草稿只允许 Owner/Admin 使用。"
-        discard_user_distilled_profile_draft(
-            platform=message.platform,
-            user_id=target_user_id,
-            discarded_by=message.user_id or "profile_discard",
-        )
+        try:
+            discard_user_distilled_profile_draft(
+                platform=message.platform,
+                user_id=target_user_id,
+                discarded_by=message.user_id or "profile_discard",
+                actor_user_id=message.user_id or "",
+                allow_cross_user=bool((not is_self) and can_manage_profiles),
+            )
+        except ValueError as exc:
+            return str(exc)
         return "已丢弃画像草稿。"
 
     field = _normalize_profile_field(str(command.get("field") or ""))
@@ -469,12 +478,17 @@ def execute_distilled_profile_command(
         value = str(command.get("value") or "").strip()
         if not value:
             return "画像字段值不能为空。"
-        record = set_user_distilled_profile_overrides(
-            platform=message.platform,
-            user_id=target_user_id,
-            overrides={field: value},
-            locked_fields=[field] if action == "lock" else None,
-        )
+        try:
+            record = set_user_distilled_profile_overrides(
+                platform=message.platform,
+                user_id=target_user_id,
+                overrides={field: value},
+                locked_fields=[field] if action == "lock" else None,
+                actor_user_id=message.user_id or "",
+                allow_cross_user=bool((not is_self) and can_manage_profiles),
+            )
+        except ValueError as exc:
+            return str(exc)
         prefix = "已锁定并更新画像字段" if action == "lock" else "已更新画像字段"
         return f"{prefix} {PROFILE_FIELD_LABELS.get(field, field)}。\n" + _format_distilled_profile(message.platform, target_user_id, record)
 
@@ -482,12 +496,17 @@ def execute_distilled_profile_command(
         existing = get_user_distilled_profile(platform=message.platform, user_id=target_user_id)
         if not isinstance(existing, dict):
             return "还没有蒸馏画像，无法解锁。"
-        record = clear_user_distilled_profile_override(
-            platform=message.platform,
-            user_id=target_user_id,
-            field=field,
-            unlock=True,
-        )
+        try:
+            record = clear_user_distilled_profile_override(
+                platform=message.platform,
+                user_id=target_user_id,
+                field=field,
+                unlock=True,
+                actor_user_id=message.user_id or "",
+                allow_cross_user=bool((not is_self) and can_manage_profiles),
+            )
+        except ValueError as exc:
+            return str(exc)
         return f"已解锁画像字段 {PROFILE_FIELD_LABELS.get(field, field)}。\n" + _format_distilled_profile(message.platform, target_user_id, record)
 
     return f"未知画像动作：{action or '-'}"

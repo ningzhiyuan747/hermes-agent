@@ -84,6 +84,21 @@ class TestWeixinGatewayCommandNormalization:
     def test_normalize_weixin_gateway_command_text_maps_status_aliases(self):
         assert normalize_weixin_gateway_command_text("状态") == "/status"
 
+    def test_normalize_weixin_gateway_command_text_maps_observer_aliases(self):
+        assert normalize_weixin_gateway_command_text("任务板") == "/task-board"
+        assert normalize_weixin_gateway_command_text("控制塔") == "/control-tower"
+        assert normalize_weixin_gateway_command_text("秘书动作") == "/secretary-loop"
+        assert normalize_weixin_gateway_command_text("操作队列") == "/operator-worklist"
+        assert normalize_weixin_gateway_command_text("后台任务状态") == "/job-status"
+        assert normalize_weixin_gateway_command_text("活跃任务") == "/active-tasks"
+        assert normalize_weixin_gateway_command_text("待批准") == "/pending-approvals"
+        assert normalize_weixin_gateway_command_text("卡住的") == "/blocked-tasks"
+        assert normalize_weixin_gateway_command_text("最近失败") == "/recent-failures"
+
+    def test_normalize_weixin_gateway_command_text_maps_low_risk_actions_with_args(self):
+        assert normalize_weixin_gateway_command_text("重投递 task-123") == "/retry-delivery task-123"
+        assert normalize_weixin_gateway_command_text("催继续 task-456") == "/follow-up task-456"
+
     def test_normalize_weixin_gateway_command_text_does_not_rewrite_questions(self):
         assert normalize_weixin_gateway_command_text("为什么停止不了") == "为什么停止不了"
 

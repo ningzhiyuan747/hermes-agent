@@ -93,6 +93,13 @@ _MEMORY_THREAT_PATTERNS = [
     (r'\$HOME/\.hermes/\.env|\~/\.hermes/\.env', "hermes_env"),
 ]
 
+_SYSTEM_MEMORY_DISALLOWED_PATTERNS = [
+    (r"\b(next step|blocker|todo|pending approval|current focus|task-\w+)\b", "task_state"),
+    (r"(下一步|阻塞|待办|审批中|当前任务|任务进展)", "task_state_cn"),
+    (r"\b(user|customer|client)\b[^\n]{0,30}\b(prefers|likes|dislikes|hates|wants)\b", "person_preference"),
+    (r"(用户|客户)[^\n]{0,20}(偏好|喜欢|讨厌|习惯)", "person_preference_cn"),
+]
+
 # Subset of invisible chars for injection detection
 _INVISIBLE_CHARS = {
     '\u200b', '\u200c', '\u200d', '\u2060', '\ufeff',
@@ -112,6 +119,17 @@ def _scan_memory_content(content: str) -> Optional[str]:
         if re.search(pattern, content, re.IGNORECASE):
             return f"Blocked: content matches threat pattern '{pid}'. Memory entries are injected into the system prompt and must not contain injection or exfiltration payloads."
 
+    return None
+
+
+def _scan_system_memory_content(content: str) -> Optional[str]:
+    """Reject obvious person/task content for system memory."""
+    for pattern, pid in _SYSTEM_MEMORY_DISALLOWED_PATTERNS:
+        if re.search(pattern, content, re.IGNORECASE):
+            return (
+                f"Blocked: content matches system-memory exclusion '{pid}'. "
+                "System memory is only for shared repo/workspace/tool facts and stable workflows."
+            )
     return None
 
 
@@ -145,13 +163,31 @@ def _build_scoped_memory_summary(entries: List[str]) -> str:
     return f"{len(entries)} 条记忆；最新：{latest}"
 
 
+def _normalize_memory_target(target: str) -> str:
+    normalized = str(target or "memory").strip().lower() or "memory"
+    if normalized in {"memory", "system"}:
+        return normalized
+    if normalized == "user":
+        return normalized
+    return normalized
+
+
+def _storage_target(target: str) -> str:
+    normalized = _normalize_memory_target(target)
+    return "memory" if normalized == "system" else normalized
+
+
 def _char_limit_for_target(target: str, store: Optional["MemoryStore"]) -> int:
-    if target == "user":
+    normalized = _storage_target(target)
+    if normalized == "user":
         return int(getattr(store, "user_char_limit", 1375) or 1375)
     return int(getattr(store, "memory_char_limit", 2200) or 2200)
 
 
 def _resolve_scoped_memory_target(target: str) -> Dict[str, str]:
+    normalized_target = _normalize_memory_target(target)
+    if normalized_target == "system":
+        return {}
     platform = str(_get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip().lower()
     if not platform:
         return {}
@@ -167,12 +203,12 @@ def _resolve_scoped_memory_target(target: str) -> Dict[str, str]:
             "kind": "user",
             "platform": platform,
             "user_id": user_id,
-            "scope": "profile" if target == "user" else "notes",
+            "scope": "profile" if normalized_target == "user" else "notes",
             "chat_type": chat_type,
             "chat_id": chat_id,
             "thread_id": thread_id,
         }
-    if task_id and target == "memory":
+    if task_id and normalized_target == "memory":
         return {
             "kind": "task",
             "task_id": task_id,
@@ -221,6 +257,11 @@ def _save_scoped_entries(target: str, target_info: Dict[str, str], entries: List
         "target": target,
         "entries": entries,
         "entry_count": len(entries),
+        "memory_scope": {
+            "kind": target_info.get("kind", ""),
+            "scope": target_info.get("scope", "shared" if target_info.get("kind") == "task" else ""),
+            "task_id": target_info.get("task_id", ""),
+        },
         "session": {
             "platform": target_info.get("platform", ""),
             "chat_id": target_info.get("chat_id", ""),
@@ -459,7 +500,8 @@ class MemoryStore:
     @staticmethod
     def _path_for(target: str) -> Path:
         mem_dir = get_memory_dir()
-        if target == "user":
+        normalized = _storage_target(target)
+        if normalized == "user":
             return mem_dir / "USER.md"
         return mem_dir / "MEMORY.md"
 
@@ -478,12 +520,14 @@ class MemoryStore:
         self._write_file(self._path_for(target), self._entries_for(target))
 
     def _entries_for(self, target: str) -> List[str]:
-        if target == "user":
+        normalized = _storage_target(target)
+        if normalized == "user":
             return self.user_entries
         return self.memory_entries
 
     def _set_entries(self, target: str, entries: List[str]):
-        if target == "user":
+        normalized = _storage_target(target)
+        if normalized == "user":
             self.user_entries = entries
         else:
             self.memory_entries = entries
@@ -495,7 +539,8 @@ class MemoryStore:
         return len(ENTRY_DELIMITER.join(entries))
 
     def _char_limit(self, target: str) -> int:
-        if target == "user":
+        normalized = _storage_target(target)
+        if normalized == "user":
             return self.user_char_limit
         return self.memory_char_limit
 
@@ -509,6 +554,10 @@ class MemoryStore:
         scan_error = _scan_memory_content(content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        if _normalize_memory_target(target) == "system":
+            system_scan_error = _scan_system_memory_content(content)
+            if system_scan_error:
+                return {"success": False, "error": system_scan_error}
 
         with self._file_lock(self._path_for(target)):
             # Re-read from disk under lock to pick up writes from other sessions
@@ -557,6 +606,10 @@ class MemoryStore:
         scan_error = _scan_memory_content(new_content)
         if scan_error:
             return {"success": False, "error": scan_error}
+        if _normalize_memory_target(target) == "system":
+            system_scan_error = _scan_system_memory_content(new_content)
+            if system_scan_error:
+                return {"success": False, "error": system_scan_error}
 
         with self._file_lock(self._path_for(target)):
             self._reload_target(target)
@@ -678,8 +731,11 @@ class MemoryStore:
         current = len(content)
         pct = min(100, int((current / limit) * 100)) if limit > 0 else 0
 
-        if target == "user":
+        normalized = _normalize_memory_target(target)
+        if normalized == "user":
             header = f"USER PROFILE (who the user is) [{pct}% — {current:,}/{limit:,} chars]"
+        elif normalized == "system":
+            header = f"SYSTEM MEMORY (shared durable facts) [{pct}% — {current:,}/{limit:,} chars]"
         else:
             header = f"MEMORY (your personal notes) [{pct}% — {current:,}/{limit:,} chars]"
 
@@ -755,12 +811,13 @@ def memory_tool(
     if store is None:
         return tool_error("Memory is not available. It may be disabled in config or this environment.", success=False)
 
-    if target not in ("memory", "user"):
-        return tool_error(f"Invalid target '{target}'. Use 'memory' or 'user'.", success=False)
+    normalized_target = _normalize_memory_target(target)
+    if normalized_target not in ("memory", "user", "system"):
+        return tool_error(f"Invalid target '{target}'. Use 'memory', 'system', or 'user'.", success=False)
 
     scoped_result = _apply_scoped_memory_action(
         action=action,
-        target=target,
+        target=normalized_target,
         content=content,
         old_text=old_text,
         store=store,
@@ -771,19 +828,19 @@ def memory_tool(
     if action == "add":
         if not content:
             return tool_error("Content is required for 'add' action.", success=False)
-        result = store.add(target, content)
+        result = store.add(normalized_target, content)
 
     elif action == "replace":
         if not old_text:
             return tool_error("old_text is required for 'replace' action.", success=False)
         if not content:
             return tool_error("content is required for 'replace' action.", success=False)
-        result = store.replace(target, old_text, content)
+        result = store.replace(normalized_target, old_text, content)
 
     elif action == "remove":
         if not old_text:
             return tool_error("old_text is required for 'remove' action.", success=False)
-        result = store.remove(target, old_text)
+        result = store.remove(normalized_target, old_text)
 
     else:
         return tool_error(f"Unknown action '{action}'. Use: add, replace, remove", success=False)
@@ -820,7 +877,10 @@ MEMORY_SCHEMA = {
         "necessary later, save it as a skill with the skill tool.\n\n"
         "TWO TARGETS:\n"
         "- 'user': who the user is -- name, role, preferences, communication style, pet peeves\n"
-        "- 'memory': your notes -- environment facts, project conventions, tool quirks, lessons learned\n\n"
+        "- 'memory': session-scoped durable notes -- private chats route to user notes, bound shared chats route to task memory\n"
+        "- 'system': shared durable system facts -- workspace paths, repo conventions, tool quirks, stable workflows\n\n"
+        "Use 'system' for cross-platform facts that are true regardless of the current chat or user. "
+        "Do not put personal preferences, user notes, or task progress into 'system'. There is no durable channel-memory bucket.\n\n"
         "ACTIONS: add (new entry), replace (update existing -- old_text identifies it), "
         "remove (delete -- old_text identifies it).\n\n"
         "SKIP: trivial/obvious info, things easily re-discovered, raw data dumps, and temporary task state."
@@ -835,8 +895,8 @@ MEMORY_SCHEMA = {
             },
             "target": {
                 "type": "string",
-                "enum": ["memory", "user"],
-                "description": "Which memory store: 'memory' for personal notes, 'user' for user profile."
+                "enum": ["memory", "system", "user"],
+                "description": "Which memory store: 'memory' for session-routed task/user notes, 'system' for shared durable system facts, 'user' for user profile."
             },
             "content": {
                 "type": "string",

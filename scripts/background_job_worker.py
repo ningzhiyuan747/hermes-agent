@@ -26,6 +26,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from hermes_constants import get_hermes_home
 from hermes_cli.env_loader import load_hermes_dotenv
+from agent.collaboration_policy import load_collaboration_policy_text
 from agent.background_jobs import (
     append_job_event,
     claim_next_job,
@@ -33,7 +34,7 @@ from agent.background_jobs import (
     release_job_lock,
     update_job,
 )
-from agent.outbound_delivery import DeliveryTarget, send_text_to_target
+from agent.background_job_delivery import deliver_job_result as _deliver_job_result
 from agent.user_profile_distiller import distill_recent_users
 
 try:
@@ -46,10 +47,73 @@ _HERMES_HOME = get_hermes_home()
 load_hermes_dotenv(hermes_home=_HERMES_HOME, project_env=REPO_ROOT / ".env")
 
 
-MAX_DELIVERY_CHARS = int(os.getenv("HERMES_BACKGROUND_JOB_DELIVERY_CHARS", "3200"))
 OPENCLAW_AGENT = str(os.getenv("HERMES_OPENCLAW_AGENT", "hermes-research") or "hermes-research").strip()
 OPENCLAW_THINKING = str(os.getenv("HERMES_OPENCLAW_THINKING", "medium") or "medium").strip()
 _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+_URL_RE = re.compile(r"https?://\S+")
+_OPENCLAW_SECTION_ALIASES = {
+    "outcome": (
+        "outcome",
+        "result",
+        "summary",
+        "executive summary",
+        "conclusion",
+        "结论",
+        "结果",
+        "概述",
+        "摘要",
+        "核心结论",
+    ),
+    "findings": (
+        "findings",
+        "key findings",
+        "observations",
+        "关键发现",
+        "发现",
+        "重点发现",
+    ),
+    "evidence": (
+        "evidence",
+        "sources",
+        "evidence and sources",
+        "references",
+        "证据",
+        "来源",
+        "证据与来源",
+        "参考来源",
+    ),
+    "risks": (
+        "risks",
+        "gaps",
+        "blockers",
+        "unknowns",
+        "risks / gaps",
+        "gaps / blockers",
+        "风险",
+        "缺口",
+        "阻塞",
+        "风险与缺口",
+        "风险和缺口",
+    ),
+    "next_step": (
+        "next step",
+        "next steps",
+        "best next move",
+        "recommended next move",
+        "action",
+        "actions",
+        "下一步",
+        "建议下一步",
+        "建议动作",
+    ),
+}
+_OPENCLAW_SECTION_TITLES = {
+    "outcome": "结论",
+    "findings": "关键发现",
+    "evidence": "证据与来源",
+    "risks": "风险与缺口",
+    "next_step": "建议下一步",
+}
 try:
     _OPENCLAW_AGENT_BY_KIND_RAW = json.loads(
         os.getenv(
@@ -253,9 +317,12 @@ def _openclaw_capability_brief(capability: str) -> tuple[str, str, list[str], li
 
 
 def _build_runner_prompt(job: dict) -> str:
+    collaboration_policy = load_collaboration_policy_text()
+    collaboration_block = f"{collaboration_policy}\n\n" if collaboration_policy else ""
     return (
         "You are running a Hermes background job. Work from the persisted job prompt, "
         "do not ask the user non-blocking questions, and return a concise final result.\n\n"
+        f"{collaboration_block}"
         "You must keep the work self-contained and summarize deliverables, evidence, blockers, and next steps.\n\n"
         f"Trace ID: {job.get('trace_id')}\n"
         f"Job ID: {job.get('job_id')}\n"
@@ -270,6 +337,8 @@ def _build_openclaw_runner_prompt(job: dict) -> str:
     worker_kind = _worker_kind_from_job(job) or "research"
     selected_agent = _resolve_openclaw_agent(job)
     mission, posture, required_skills, guardrails = _openclaw_capability_brief(capability)
+    collaboration_policy = load_collaboration_policy_text()
+    collaboration_block = f"{collaboration_policy}\n\n" if collaboration_policy else ""
     skill_lines = "\n".join(f"- {item}" for item in required_skills)
     guardrail_lines = "\n".join(f"- {item}" for item in guardrails)
     return (
@@ -286,15 +355,18 @@ def _build_openclaw_runner_prompt(job: dict) -> str:
         f"Working posture: {posture}\n"
         f"Job ID: {job.get('job_id')}\n"
         f"Title: {job.get('title')}\n\n"
+        f"{collaboration_block}"
         "Required skills for this run:\n"
         f"{skill_lines}\n\n"
         "Guardrails:\n"
         f"{guardrail_lines}\n\n"
-        "Return a concise final answer with these sections when relevant:\n"
-        "1. Outcome\n"
-        "2. Evidence\n"
-        "3. Gaps / blockers\n"
-        "4. Best next move\n\n"
+        "Return the final answer as a compact research handoff with these exact sections whenever possible:\n"
+        "1. 结论\n"
+        "2. 关键发现\n"
+        "3. 证据与来源\n"
+        "4. 风险与缺口\n"
+        "5. 建议下一步\n"
+        "Keep each section tight, evidence-first, and usable by Hermes without more cleanup.\n\n"
         "Delegated job prompt:\n"
         f"{job.get('prompt') or ''}"
     )
@@ -370,6 +442,112 @@ def _extract_openclaw_payload(stdout: str) -> tuple[str, dict]:
     return cleaned, {}
 
 
+def _normalize_openclaw_heading(value: str) -> str:
+    normalized = str(value or "").strip().lower()
+    normalized = normalized.lstrip("#*- ").strip()
+    normalized = normalized.rstrip(":：").strip()
+    return normalized
+
+
+def _match_openclaw_section(line: str) -> str:
+    normalized = _normalize_openclaw_heading(line)
+    if not normalized:
+        return ""
+    for key, aliases in _OPENCLAW_SECTION_ALIASES.items():
+        if normalized in aliases:
+            return key
+    return ""
+
+
+def _parse_openclaw_sections(text: str) -> dict[str, str]:
+    sections = {key: [] for key in _OPENCLAW_SECTION_TITLES}
+    current = "outcome"
+    for raw_line in str(text or "").splitlines():
+        stripped = raw_line.strip()
+        matched = _match_openclaw_section(stripped)
+        if matched:
+            current = matched
+            continue
+        if stripped:
+            sections[current].append(stripped)
+    return {key: "\n".join(lines).strip() for key, lines in sections.items() if any(line.strip() for line in lines)}
+
+
+def _infer_openclaw_evidence(text: str) -> str:
+    urls = []
+    seen = set()
+    for match in _URL_RE.findall(str(text or "")):
+        url = match.rstrip(").,;]")
+        if url not in seen:
+            urls.append(url)
+            seen.add(url)
+    if not urls:
+        return ""
+    return "\n".join(f"- {url}" for url in urls)
+
+
+def _default_openclaw_next_step(capability: str) -> str:
+    normalized = str(capability or "").strip().lower()
+    if normalized == "contract_retrieval":
+        return "沿着上面的证据链继续复核合同原件或附件是否可访问；若仍缺关键文件，明确需要补哪条内部来源或授权。"
+    if normalized == "bid_research":
+        return "优先跟进最匹配、最可执行的机会，并补齐预算、时间窗、采购主体等决定性线索。"
+    return "基于上面的证据先做人工复核，再决定是否需要 Hermes 发起后续跟进、续跑或改派。"
+
+
+def _format_openclaw_research_report(
+    job: dict,
+    text: str,
+    *,
+    agent: str,
+    provider: str = "",
+    model: str = "",
+    usage_total: object = None,
+) -> str:
+    cleaned = _strip_ansi(text).strip()
+    parsed = _parse_openclaw_sections(cleaned)
+    capability = _capability_from_job(job) or "research"
+    outcome = parsed.get("outcome") or cleaned or "未拿到可用结果。"
+    evidence = parsed.get("evidence") or _infer_openclaw_evidence(cleaned) or "未发现可直接引用的来源链接；需要结合完整任务记录复核。"
+    risks = parsed.get("risks") or "仍需人工复核关键证据，避免把弱线索当成最终结论。"
+    next_step = parsed.get("next_step") or _default_openclaw_next_step(capability)
+
+    sections = [
+        "OpenClaw 研究交付",
+        f"任务: {str(job.get('title') or job.get('job_id') or '').strip() or '-'}",
+        f"能力: {capability}",
+        f"Agent: {agent or '-'}",
+    ]
+    if provider or model:
+        sections.append(f"模型: {provider or '-'} / {model or '-'}")
+    if usage_total:
+        sections.append(f"Tokens(total): {usage_total}")
+    sections.extend(
+        [
+            "",
+            "结论",
+            outcome,
+        ]
+    )
+    findings = parsed.get("findings")
+    if findings:
+        sections.extend(["", "关键发现", findings])
+    sections.extend(
+        [
+            "",
+            "证据与来源",
+            evidence,
+            "",
+            "风险与缺口",
+            risks,
+            "",
+            "建议下一步",
+            next_step,
+        ]
+    )
+    return "\n".join(str(item).rstrip() for item in sections).strip()
+
+
 def _run_openclaw_for_job(job: dict, timeout: int) -> tuple[int, str, str]:
     prompt = _build_openclaw_runner_prompt(job)
     selected_agent = _resolve_openclaw_agent(job)
@@ -414,11 +592,11 @@ def _run_openclaw_for_job(job: dict, timeout: int) -> tuple[int, str, str]:
             raise
         raw_stream = stdout_raw or stderr_raw or ""
         text_result, payload = _extract_openclaw_payload(raw_stream)
-        if text_result:
-            stdout = text_result
-        else:
-            stdout = _strip_ansi(raw_stream)
+        source_text = text_result or _strip_ansi(raw_stream)
         stderr = _strip_ansi(stderr_raw or "")
+        provider = ""
+        model = ""
+        usage_total = None
         if payload:
             meta = payload.get("meta") if isinstance(payload.get("meta"), dict) else {}
             agent_meta = meta.get("agentMeta") if isinstance(meta.get("agentMeta"), dict) else {}
@@ -426,14 +604,14 @@ def _run_openclaw_for_job(job: dict, timeout: int) -> tuple[int, str, str]:
             provider = str(agent_meta.get("provider") or "").strip()
             usage = agent_meta.get("usage") if isinstance(agent_meta.get("usage"), dict) else {}
             usage_total = usage.get("total")
-            trailer = []
-            trailer.append(f"OpenClaw agent: {selected_agent}")
-            if provider or model:
-                trailer.append(f"OpenClaw worker: {provider or '-'} / {model or '-'}")
-            if usage_total:
-                trailer.append(f"OpenClaw tokens(total): {usage_total}")
-            if trailer:
-                stdout = (stdout.rstrip() + "\n\n" + "\n".join(trailer)).strip()
+        stdout = _format_openclaw_research_report(
+            job,
+            source_text,
+            agent=selected_agent,
+            provider=provider,
+            model=model,
+            usage_total=usage_total,
+        )
         return process.returncode, stdout, stderr
     finally:
         update_job(
@@ -441,83 +619,6 @@ def _run_openclaw_for_job(job: dict, timeout: int) -> tuple[int, str, str]:
             runner_pid=None,
             runner_runtime="",
         )
-
-
-def _delivery_target(job: dict) -> str:
-    origin = job.get("origin") if isinstance(job.get("origin"), dict) else {}
-    target = DeliveryTarget.from_origin(origin)
-    if not target.is_valid():
-        return ""
-    return target.to_target_ref()
-
-
-def _trim_for_delivery(text: str) -> tuple[str, bool]:
-    cleaned = str(text or "").strip()
-    if len(cleaned) <= MAX_DELIVERY_CHARS:
-        return cleaned, False
-    return cleaned[:MAX_DELIVERY_CHARS].rstrip() + "\n\n...（内容较长，完整结果已存入后台任务记录）", True
-
-
-def _format_delivery_message(job: dict, *, failed: bool = False) -> str:
-    job_id = str(job.get("job_id") or "")
-    title = str(job.get("title") or job_id)
-    result = str(job.get("result") or "").strip()
-    blocker = str(job.get("blocker") or "").strip()
-    body = blocker if failed and blocker else result
-    body, truncated = _trim_for_delivery(body or "没有可展示的结果。")
-    status_text = "失败" if failed else "完成"
-    lines = [
-        f"后台任务{status_text}：{title}",
-        f"Job: {job_id}",
-        "",
-        body,
-    ]
-    if truncated:
-        lines.append("")
-        lines.append("可发“后台任务状态”查看任务 ID，再按 ID 查完整记录。")
-    return "\n".join(lines).strip()
-
-
-def _deliver_job_result(job: dict, *, failed: bool = False) -> None:
-    if os.getenv("HERMES_BACKGROUND_JOB_AUTO_DELIVER", "true").strip().lower() not in {"1", "true", "yes", "on"}:
-        return
-    if job.get("delivered_at_unix"):
-        return
-
-    job_id = str(job.get("job_id") or "")
-    target = _delivery_target(job)
-    if not target:
-        update_job(
-            job_id,
-            delivery_status="skipped",
-            delivery_error="No origin platform/chat_id recorded for this job.",
-        )
-        append_job_event(job_id, kind="delivery", message="Skipped delivery: no origin target.")
-        return
-
-    try:
-        result = send_text_to_target(
-            DeliveryTarget.from_origin(job.get("origin") if isinstance(job.get("origin"), dict) else {}),
-            _format_delivery_message(job, failed=failed),
-        )
-        if isinstance(result, dict) and result.get("error"):
-            raise RuntimeError(str(result.get("error")))
-        update_job(
-            job_id,
-            delivery_status="delivered",
-            delivery_error="",
-            delivery_target=target,
-            delivered_at_unix=int(time.time()),
-        )
-        append_job_event(job_id, kind="delivery", message=f"Delivered result to {target}.")
-    except Exception as exc:
-        update_job(
-            job_id,
-            delivery_status="failed",
-            delivery_error=f"{type(exc).__name__}: {exc}",
-            delivery_target=target,
-        )
-        append_job_event(job_id, kind="delivery_failed", message=f"{type(exc).__name__}: {exc}")
 
 
 def run_one(timeout: int, executor: str) -> bool:

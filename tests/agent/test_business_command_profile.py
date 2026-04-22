@@ -144,6 +144,54 @@ def test_execute_distilled_profile_command_publishes_draft(monkeypatch):
     assert text.startswith("已发布画像草稿。")
 
 
+def test_execute_distilled_profile_command_admin_publish_passes_cross_user_governance(monkeypatch):
+    captured = {}
+
+    def _publish(**kwargs):
+        captured.update(kwargs)
+        return {"summary": "工作风格：结果导向。", "memory": {"profile": {"working_style": "结果导向"}}}
+
+    monkeypatch.setattr("agent.business_command_ops.publish_user_distilled_profile_draft", _publish)
+    monkeypatch.setattr(
+        "agent.business_command_ops.get_user",
+        lambda **_kwargs: {"display_name": "张三"},
+    )
+
+    text = execute_distilled_profile_command(
+        _message("发布画像 ou_other", user_id="owner-1"),
+        {"action": "publish", "user_id": "ou_other"},
+        can_manage_profiles=True,
+    )
+
+    assert text.startswith("已发布画像草稿。")
+    assert captured["actor_user_id"] == "owner-1"
+    assert captured["allow_cross_user"] is True
+
+
+def test_execute_distilled_profile_command_returns_governance_error_for_group_edit(monkeypatch):
+    monkeypatch.setattr(
+        "agent.business_command_ops.set_user_distilled_profile_overrides",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("distilled profile mutations require a private 1:1 conversation")),
+    )
+
+    message = IncomingMessage(
+        platform="dingtalk",
+        chat_id="cid_group_1",
+        chat_type="group",
+        user_id="ou_user_1",
+        user_name="Tester",
+        text="设画像 输出偏好=先结论",
+        session_key="session-group-1",
+    )
+    text = execute_distilled_profile_command(
+        message,
+        {"action": "set", "field": "输出偏好", "value": "先结论"},
+        can_manage_profiles=False,
+    )
+
+    assert text == "distilled profile mutations require a private 1:1 conversation"
+
+
 def test_execute_distilled_profile_command_formats_diff(monkeypatch):
     monkeypatch.setattr(
         "agent.business_command_ops.get_user",

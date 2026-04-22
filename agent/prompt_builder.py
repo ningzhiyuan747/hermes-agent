@@ -15,6 +15,7 @@ from pathlib import Path
 from hermes_constants import get_hermes_home, get_skills_dir, is_wsl
 from typing import Optional
 
+from agent.collaboration_policy import load_collaboration_policy_text
 from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
@@ -136,8 +137,9 @@ DEFAULT_AGENT_IDENTITY = (
 )
 
 MEMORY_GUIDANCE = (
-    "Save only durable facts to memory: user preferences, environment details, and stable conventions. "
-    "Do not save task logs or temporary state; use session_search for past work."
+    "Save only durable facts to memory: user preferences go to user memory, shared repo/workspace/tool facts go to system memory, "
+    "and shared chat context only goes to task memory when a task is bound. "
+    "Do not save task logs, temporary state, or invent a channel-memory layer; use session_search for past work."
 )
 
 SESSION_SEARCH_GUIDANCE = (
@@ -150,6 +152,10 @@ SKILLS_GUIDANCE = (
 
 TOOL_ROUTING_GUIDANCE = (
     "Route by smallest relevant bucket first: file, terminal, web, browser, skills, memory, messaging, scheduling. Expand only when needed for completion or verification."
+)
+
+TASK_CONTINUITY_GUIDANCE = (
+    "When the task spans multiple steps, prefer persistent work products over one-off chat state: update files, docs, task boards, or other durable outputs so work can resume without losing context."
 )
 
 TOOL_USE_ENFORCEMENT_GUIDANCE = (
@@ -761,6 +767,31 @@ def build_tool_guidance_block(valid_tool_names: "set[str] | None" = None) -> str
     """Build a compact task/tool guidance block for the system prompt."""
     tool_names = set(valid_tool_names or set())
     lines: list[str] = []
+    capability_buckets = [
+        ("file", {"read_file", "write_file", "patch", "search_files"}),
+        ("terminal", {"terminal", "process", "execute_code"}),
+        ("browser", {"browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll", "browser_console", "browser_press", "browser_get_images", "browser_vision"}),
+        ("web", {"web_search", "web_extract"}),
+        ("memory", {"memory", "fact_store", "fact_feedback"}),
+        ("recall", {"session_search"}),
+        ("skills", {"skills_list", "skill_view", "skill_manage"}),
+        ("messaging", {"send_message"}),
+        ("scheduling", {"cronjob"}),
+        ("delegation", {"delegate_task"}),
+        ("vision", {"vision_analyze"}),
+        ("todo", {"todo"}),
+    ]
+    available_capabilities = [
+        label for label, members in capability_buckets if tool_names & members
+    ]
+    if available_capabilities:
+        lines.append(
+            "- tool-surface: available capabilities in this session = "
+            + ", ".join(available_capabilities)
+            + ". Prefer these live tools over guessing about unavailable ones."
+        )
+    if tool_names & {"read_file", "write_file", "patch", "search_files", "todo"}:
+        lines.append(f"- continuity: {TASK_CONTINUITY_GUIDANCE}")
     if "memory" in tool_names:
         lines.append(f"- memory: {MEMORY_GUIDANCE}")
     if "session_search" in tool_names:
@@ -772,6 +803,17 @@ def build_tool_guidance_block(valid_tool_names: "set[str] | None" = None) -> str
     if not lines:
         return ""
     return "# Working rules\n" + "\n".join(lines)
+
+
+def build_collaboration_policy_block() -> str:
+    """Load, sanitize, and bound the shared Hermes/OpenClaw collaboration policy."""
+    content = load_collaboration_policy_text()
+    if not content:
+        return ""
+    content = _strip_yaml_frontmatter(content)
+    content = _scan_context_content(content, "collaboration_policy.md")
+    content = _truncate_content(content, "collaboration_policy.md")
+    return "# Collaboration policy\n" + content
 
 
 def build_nous_subscription_prompt(valid_tool_names: "set[str] | None" = None) -> str:
