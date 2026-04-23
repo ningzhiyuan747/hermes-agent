@@ -34,7 +34,7 @@ from typing import Optional
 # the module) fail with ModuleNotFoundError for hermes_time et al.
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_cron_home, get_hermes_home
 from hermes_cli.config import load_config
 from hermes_time import now as _hermes_now
 
@@ -90,6 +90,18 @@ def _resolve_hermes_home() -> Path:
     if _hermes_home != _DEFAULT_HERMES_HOME:
         return Path(_hermes_home)
     return get_hermes_home()
+
+
+def _resolve_cron_home() -> Path:
+    """Resolve the shared cron/state home at call time.
+
+    Cron job registry/output already live under the shared Hermes root. Keep
+    cron session persistence there too so session search and audits do not get
+    split across profile-specific ``state.db`` files.
+    """
+    if _hermes_home != _DEFAULT_HERMES_HOME:
+        return Path(_hermes_home)
+    return get_cron_home()
 
 
 def _lock_dir() -> Path:
@@ -632,7 +644,7 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
     _session_db = None
     try:
         from hermes_state import SessionDB
-        _session_db = SessionDB()
+        _session_db = SessionDB(db_path=_resolve_cron_home() / "state.db")
     except Exception as e:
         logger.debug("Job '%s': SQLite session store not available: %s", job.get("id", "?"), e)
     

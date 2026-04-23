@@ -99,18 +99,48 @@ def _honcho_is_configured_for_doctor() -> bool:
         return False
 
 
+def _optional_tool_is_configured_for_doctor(tool_name: str) -> bool:
+    """Return True when an opt-in integration is explicitly configured.
+
+    Some toolsets are optional product extensions rather than baseline Hermes
+    functionality. When they are completely unconfigured, doctor should not
+    present them as actionable breakage.
+    """
+    normalized = str(tool_name or "").strip().lower()
+    if normalized == "homeassistant":
+        return bool(os.getenv("HASS_TOKEN", "").strip())
+    if normalized == "image_gen":
+        return bool(os.getenv("FAL_KEY", "").strip())
+    if normalized == "moa":
+        return bool(os.getenv("OPENROUTER_API_KEY", "").strip())
+    if normalized == "rl":
+        return bool(os.getenv("TINKER_API_KEY", "").strip() or os.getenv("WANDB_API_KEY", "").strip())
+    return False
+
+
+def _has_interactive_model_auth_for_doctor() -> bool:
+    """Return True when a non-.env interactive auth flow is already usable."""
+    try:
+        from hermes_cli.auth import get_codex_auth_status
+
+        return bool(get_codex_auth_status().get("logged_in"))
+    except Exception:
+        return False
+
+
 def _apply_doctor_tool_availability_overrides(available: list[str], unavailable: list[dict]) -> tuple[list[str], list[dict]]:
     """Adjust runtime-gated tool availability for doctor diagnostics."""
-    if not _honcho_is_configured_for_doctor():
-        return available, unavailable
-
     updated_available = list(available)
     updated_unavailable = []
     for item in unavailable:
         if item.get("name") == "honcho":
-            if "honcho" not in updated_available:
-                updated_available.append("honcho")
-            continue
+            if _honcho_is_configured_for_doctor():
+                if "honcho" not in updated_available:
+                    updated_available.append("honcho")
+                continue
+        elif item.get("name") in {"homeassistant", "image_gen", "moa", "rl"}:
+            if not _optional_tool_is_configured_for_doctor(item.get("name")):
+                continue
         updated_unavailable.append(item)
     return updated_available, updated_unavailable
 
@@ -253,6 +283,8 @@ def run_doctor(args):
         content = env_path.read_text()
         if _has_provider_env_config(content):
             check_ok("API key or custom endpoint configured")
+        elif _has_interactive_model_auth_for_doctor():
+            check_ok("Interactive model auth configured", "(OpenAI Codex login)")
         else:
             check_warn(f"No API key found in {_DHH}/.env")
             issues.append("Run 'hermes setup' to configure API keys")

@@ -686,6 +686,44 @@ class TestRunJobSessionPersistence:
         assert call_args[0][1] == "cron_complete"
         fake_db.close.assert_called_once()
 
+    def test_run_job_persists_cron_sessions_to_shared_root_state_db(self, tmp_path):
+        job = {
+            "id": "test-job",
+            "name": "test",
+            "prompt": "hello",
+        }
+        fake_db = MagicMock()
+        profile_home = tmp_path / "profiles" / "openclaw"
+        shared_root = tmp_path
+
+        with patch("cron.scheduler._hermes_home", profile_home), \
+             patch("cron.scheduler._DEFAULT_HERMES_HOME", profile_home), \
+             patch("cron.scheduler.get_cron_home", return_value=shared_root), \
+             patch("cron.scheduler._resolve_origin", return_value=None), \
+             patch("dotenv.load_dotenv"), \
+             patch("hermes_state.SessionDB", return_value=fake_db) as mock_session_db, \
+             patch(
+                 "hermes_cli.runtime_provider.resolve_runtime_provider",
+                 return_value={
+                     "api_key": "test-key",
+                     "base_url": "https://example.invalid/v1",
+                     "provider": "openrouter",
+                     "api_mode": "chat_completions",
+                 },
+             ), \
+             patch("run_agent.AIAgent") as mock_agent_cls:
+            mock_agent = MagicMock()
+            mock_agent.run_conversation.return_value = {"final_response": "ok"}
+            mock_agent_cls.return_value = mock_agent
+
+            success, output, final_response, error = run_job(job)
+
+        assert success is True
+        assert error is None
+        assert final_response == "ok"
+        assert "ok" in output
+        mock_session_db.assert_called_once_with(db_path=shared_root / "state.db")
+
     def test_run_job_empty_response_returns_empty_not_placeholder(self, tmp_path):
         """Empty final_response should stay empty for delivery logic (issue #2234).
 
