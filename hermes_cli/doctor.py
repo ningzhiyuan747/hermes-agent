@@ -9,6 +9,7 @@ import sys
 import subprocess
 import shutil
 from pathlib import Path
+from typing import Any
 
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_constants import display_hermes_home
@@ -156,6 +157,140 @@ def check_fail(text: str, detail: str = ""):
 
 def check_info(text: str):
     print(f"    {color('→', Colors.CYAN)} {text}")
+
+
+def _platform_has_delivery_credentials(platform: Any, pconfig: Any) -> bool:
+    if not pconfig or not getattr(pconfig, "enabled", False):
+        return False
+    if str(getattr(pconfig, "token", "") or "").strip():
+        return True
+    if str(getattr(pconfig, "api_key", "") or "").strip():
+        return True
+    extra = getattr(pconfig, "extra", {}) or {}
+    platform_name = str(getattr(platform, "value", platform) or "").strip().lower()
+    if platform_name == "feishu":
+        return bool(str(extra.get("app_id") or "").strip() and str(extra.get("app_secret") or "").strip())
+    if platform_name == "dingtalk":
+        return bool(str(extra.get("client_id") or "").strip() and str(extra.get("client_secret") or "").strip())
+    return bool(extra)
+
+
+def _build_task_runtime_diagnostics(*, limit: int = 5) -> dict[str, Any]:
+    diagnostics: dict[str, Any] = {
+        "snapshot_ok": False,
+        "snapshot_error": "",
+        "task_truth_summary": {},
+        "task_failure_summary": {},
+        "platforms": {},
+        "platform_error": "",
+    }
+    try:
+        from agent.operational_task_board_service import build_operational_task_snapshot
+
+        snapshot = build_operational_task_snapshot(limit=max(1, limit))
+    except Exception as exc:
+        diagnostics["snapshot_error"] = str(exc)
+        return diagnostics
+
+    diagnostics["snapshot_ok"] = True
+    diagnostics["task_truth_summary"] = snapshot.get("task_truth_summary") if isinstance(snapshot.get("task_truth_summary"), dict) else {}
+    diagnostics["task_failure_summary"] = snapshot.get("task_failure_summary") if isinstance(snapshot.get("task_failure_summary"), dict) else {}
+
+    delivery_platforms = diagnostics["task_failure_summary"].get("delivery_platforms")
+    if not isinstance(delivery_platforms, dict) or not delivery_platforms:
+        return diagnostics
+
+    try:
+        from gateway.config import Platform, load_gateway_config
+
+        config = load_gateway_config()
+        platform_map = {platform.value: platform for platform in Platform}
+        for platform_name, affected_count in delivery_platforms.items():
+            platform = platform_map.get(str(platform_name or "").strip().lower())
+            if platform is None:
+                continue
+            if hasattr(config, "get_delivery_platform_config"):
+                pconfig = config.get_delivery_platform_config(platform)
+                home = config.get_delivery_home_channel(platform)
+            else:
+                pconfig = getattr(config, "platforms", {}).get(platform)
+                home = config.get_home_channel(platform) if hasattr(config, "get_home_channel") else None
+            diagnostics["platforms"][platform_name] = {
+                "affected_tasks": int(affected_count or 0),
+                "configured": bool(pconfig and getattr(pconfig, "enabled", False)),
+                "credentials_ready": _platform_has_delivery_credentials(platform, pconfig),
+                "home_ready": bool(home and str(getattr(home, "chat_id", "") or "").strip()),
+            }
+    except Exception as exc:
+        diagnostics["platform_error"] = str(exc)
+
+    return diagnostics
+
+
+def _check_task_runtime_health(issues: list[str]) -> None:
+    print()
+    print(color("◆ Task Runtime", Colors.CYAN, Colors.BOLD))
+
+    diagnostics = _build_task_runtime_diagnostics(limit=6)
+    if not diagnostics.get("snapshot_ok"):
+        check_warn("Operational task board unavailable", f"({diagnostics.get('snapshot_error') or 'unknown error'})")
+        return
+
+    truth = diagnostics.get("task_truth_summary") if isinstance(diagnostics.get("task_truth_summary"), dict) else {}
+    failures = diagnostics.get("task_failure_summary") if isinstance(diagnostics.get("task_failure_summary"), dict) else {}
+    active_tasks = int(truth.get("active_tasks") or 0)
+    backed_tasks = int(truth.get("active_tasks_with_active_trace") or 0)
+    unbacked_tasks = int(truth.get("active_tasks_without_active_trace") or 0)
+    orphaned_traces = truth.get("orphaned_active_traces") if isinstance(truth.get("orphaned_active_traces"), dict) else {}
+    terminal_task_traces = truth.get("terminal_task_active_traces") if isinstance(truth.get("terminal_task_active_traces"), dict) else {}
+    failure_kinds = failures.get("failure_kinds") if isinstance(failures.get("failure_kinds"), dict) else {}
+    delivery_statuses = failures.get("delivery_statuses") if isinstance(failures.get("delivery_statuses"), dict) else {}
+
+    check_ok("Task truth summary", f"(active={active_tasks}, backed={backed_tasks}, unbacked={unbacked_tasks})")
+    if unbacked_tasks > 0:
+        missing_ids = truth.get("active_task_ids_without_active_trace") if isinstance(truth.get("active_task_ids_without_active_trace"), list) else []
+        detail = f"(task ids: {', '.join(str(item) for item in missing_ids[:4])})" if missing_ids else ""
+        check_warn("Active tasks without active traces", detail)
+        issues.append("Investigate active tasks that no longer have a linked run/job/delegation trace")
+    else:
+        check_ok("Active tasks are backed by traces")
+
+    orphaned_total = sum(int(value or 0) for value in orphaned_traces.values())
+    if orphaned_total > 0:
+        check_warn("Orphaned active traces detected", f"({orphaned_traces})")
+        issues.append("Reconcile orphaned active runs/jobs/delegations back into task records")
+    else:
+        check_ok("No orphaned active traces")
+
+    terminal_trace_total = sum(int(value or 0) for value in terminal_task_traces.values())
+    if terminal_trace_total > 0:
+        check_warn("Terminal tasks still have active traces", f"({terminal_task_traces})")
+        issues.append("Terminate or relink traces that are still active under completed/failed/cancelled tasks")
+    else:
+        check_ok("No active traces under terminal tasks")
+
+    if failure_kinds:
+        check_info(f"Failure kinds: {failure_kinds}")
+    if delivery_statuses:
+        check_info(f"Delivery statuses: {delivery_statuses}")
+
+    for platform_name, platform_diag in (diagnostics.get("platforms") or {}).items():
+        affected_tasks = int(platform_diag.get("affected_tasks") or 0)
+        configured = bool(platform_diag.get("configured"))
+        credentials_ready = bool(platform_diag.get("credentials_ready"))
+        home_ready = bool(platform_diag.get("home_ready"))
+        label = f"{platform_name} delivery config"
+        if configured and credentials_ready and home_ready:
+            check_ok(label, f"(affected tasks={affected_tasks}, credentials/home ready)")
+            continue
+        check_warn(
+            label,
+            f"(affected tasks={affected_tasks}, configured={configured}, credentials={credentials_ready}, home={home_ready})",
+        )
+        issues.append(f"Repair {platform_name} delivery config so background results can be delivered")
+
+    if diagnostics.get("platform_error"):
+        check_warn("Delivery platform diagnostics incomplete", f"({diagnostics.get('platform_error')})")
 
 
 def _check_gateway_service_linger(issues: list[str]) -> None:
@@ -1021,6 +1156,11 @@ def run_doctor(args):
         check_ok("GitHub token configured (authenticated API access)")
     else:
         check_warn("No GITHUB_TOKEN", f"(60 req/hr rate limit — set in {_DHH}/.env for better rates)")
+
+    # =========================================================================
+    # Task Runtime
+    # =========================================================================
+    _check_task_runtime_health(issues)
 
     # =========================================================================
     # Memory Provider (only check the active provider, if any)

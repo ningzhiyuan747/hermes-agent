@@ -186,6 +186,33 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
     assert "OpenClaw 启动冒烟已成功" in snapshot["derived_signals"][0]
     assert "飞书投递凭证仍未就绪" in snapshot["derived_signals"][1]
     assert "deliver=origin" in snapshot["derived_signals"][2]
+    assert snapshot["task_truth_summary"] == {
+        "active_tasks": 1,
+        "active_tasks_with_active_trace": 1,
+        "active_tasks_without_active_trace": 0,
+        "active_task_ids_without_active_trace": [],
+        "linked_active_traces": {
+            "capability_runs": 1,
+            "background_jobs": 1,
+            "delegation_tasks": 0,
+        },
+        "orphaned_active_traces": {
+            "capability_runs": 0,
+            "background_jobs": 0,
+            "delegation_tasks": 1,
+        },
+        "terminal_task_active_traces": {
+            "capability_runs": 0,
+            "background_jobs": 0,
+            "delegation_tasks": 0,
+        },
+    }
+    assert snapshot["task_failure_summary"] == {
+        "failure_kinds": {},
+        "delivery_statuses": {"pending": 1},
+        "dispatch_actions": {"continue_current": 1},
+        "delivery_platforms": {},
+    }
 
     first = snapshot["units"][0]
     assert first["unit_id"] == "task:task-1"

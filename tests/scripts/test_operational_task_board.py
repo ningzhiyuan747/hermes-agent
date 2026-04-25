@@ -51,6 +51,21 @@ def test_build_report_highlights_distributed_task_state():
             "executor_overrides": {"codex": 1},
             "operator_queue_next": {"Switch task to executor 'codex'.": 1},
         },
+        "task_truth_summary": {
+            "active_tasks": 1,
+            "active_tasks_with_active_trace": 1,
+            "active_tasks_without_active_trace": 0,
+            "active_task_ids_without_active_trace": [],
+            "linked_active_traces": {"capability_runs": 1, "background_jobs": 0, "delegation_tasks": 0},
+            "orphaned_active_traces": {"capability_runs": 0, "background_jobs": 1, "delegation_tasks": 1},
+            "terminal_task_active_traces": {"capability_runs": 0, "background_jobs": 0, "delegation_tasks": 0},
+        },
+        "task_failure_summary": {
+            "failure_kinds": {"routing_failed": 1},
+            "delivery_statuses": {"pending": 1, "failed": 1},
+            "dispatch_actions": {"continue_current": 1, "retry_delivery": 1},
+            "delivery_platforms": {"dingtalk": 1},
+        },
         "reconcile_summary": {
             "runs_scanned": 1,
             "runs_linked": 1,
@@ -129,11 +144,15 @@ def test_build_report_highlights_distributed_task_state():
     assert "任务面热点: {'dingtalk:chat:group-1': 1, 'dingtalk:chat:group-2': 1}" in report
     assert "人物记忆热点: {'dingtalk:user:alice': 1, 'dingtalk:user:bob': 1}" in report
     assert "会话角色分布: {'task_group': 2}" in report
+    assert "task 真相摘要: active=1, backed=1, unbacked=0" in report
+    assert "已挂到 task 主记录的活跃 traces: {'capability_runs': 1, 'background_jobs': 0, 'delegation_tasks': 0}" in report
+    assert "游离活跃 traces: {'capability_runs': 0, 'background_jobs': 1, 'delegation_tasks': 1}" in report
     assert "秘书动作分布: {'retry_delivery': 1}" in report
     assert "秘书改派请求: {'codex': 1}" in report
     assert "待处理操作队列: {\"Switch task to executor 'codex'.\": 1}" in report
     assert "失败分类分布: {'routing_failed': 1}" in report
     assert "投递状态分布: {'pending': 1, 'failed': 1}" in report
+    assert "投递失败平台: {'dingtalk': 1}" in report
     assert "调度动作分布: {'continue_current': 1, 'retry_delivery': 1}" in report
     assert "本轮回灌: runs 1/1, jobs 1/2, delegations 1/1, tasks 2/3" in report
     assert "OpenClaw 启动冒烟已成功" in report

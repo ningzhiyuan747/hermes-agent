@@ -135,6 +135,8 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     if run_counts.get("queued", 0):
         lines.append(f"- capability run 中 queued 较多（queued={run_counts.get('queued', 0)}），需要继续推进状态回填与统一调度。")
     scope_summary = snapshot.get("scope_summary") if isinstance(snapshot.get("scope_summary"), dict) else {}
+    task_truth_summary = snapshot.get("task_truth_summary") if isinstance(snapshot.get("task_truth_summary"), dict) else {}
+    task_failure_summary = snapshot.get("task_failure_summary") if isinstance(snapshot.get("task_failure_summary"), dict) else {}
     top_task_scopes = scope_summary.get("task_scopes") if isinstance(scope_summary.get("task_scopes"), dict) else {}
     top_person_memories = scope_summary.get("person_memories") if isinstance(scope_summary.get("person_memories"), dict) else {}
     top_roles = scope_summary.get("conversation_roles") if isinstance(scope_summary.get("conversation_roles"), dict) else {}
@@ -143,29 +145,32 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
     top_follow_up_targets = scope_summary.get("follow_up_targets") if isinstance(scope_summary.get("follow_up_targets"), dict) else {}
     top_operator_queue_next = scope_summary.get("operator_queue_next") if isinstance(scope_summary.get("operator_queue_next"), dict) else {}
     top_operator_resolutions = scope_summary.get("operator_resolutions") if isinstance(scope_summary.get("operator_resolutions"), dict) else {}
-    failure_kinds = {}
-    delivery_statuses = {}
-    dispatch_actions = {}
-    for unit in units:
-        if str(unit.get("unit_type") or "") != "task":
-            continue
-        failure_kind = str(unit.get("failure_kind") or "").strip()
-        if not failure_kind:
-            pass
-        else:
-            failure_kinds[failure_kind] = int(failure_kinds.get(failure_kind, 0)) + 1
-        delivery_status = str(unit.get("delivery_status") or "").strip()
-        if delivery_status:
-            delivery_statuses[delivery_status] = int(delivery_statuses.get(delivery_status, 0)) + 1
-        dispatch_action = str(unit.get("dispatch_action") or "").strip()
-        if dispatch_action:
-            dispatch_actions[dispatch_action] = int(dispatch_actions.get(dispatch_action, 0)) + 1
+    failure_kinds = task_failure_summary.get("failure_kinds") if isinstance(task_failure_summary.get("failure_kinds"), dict) else {}
+    delivery_statuses = task_failure_summary.get("delivery_statuses") if isinstance(task_failure_summary.get("delivery_statuses"), dict) else {}
+    dispatch_actions = task_failure_summary.get("dispatch_actions") if isinstance(task_failure_summary.get("dispatch_actions"), dict) else {}
+    delivery_platforms = task_failure_summary.get("delivery_platforms") if isinstance(task_failure_summary.get("delivery_platforms"), dict) else {}
+    linked_traces = task_truth_summary.get("linked_active_traces") if isinstance(task_truth_summary.get("linked_active_traces"), dict) else {}
+    orphaned_traces = task_truth_summary.get("orphaned_active_traces") if isinstance(task_truth_summary.get("orphaned_active_traces"), dict) else {}
+    terminal_task_traces = task_truth_summary.get("terminal_task_active_traces") if isinstance(task_truth_summary.get("terminal_task_active_traces"), dict) else {}
     if top_task_scopes:
         lines.append(f"- 任务面热点: {top_task_scopes}")
         if top_person_memories:
             lines.append(f"- 人物记忆热点: {top_person_memories}")
         if top_roles:
             lines.append(f"- 会话角色分布: {top_roles}")
+    if task_truth_summary:
+        lines.append(
+            "- task 真相摘要: "
+            f"active={int(task_truth_summary.get('active_tasks') or 0)}, "
+            f"backed={int(task_truth_summary.get('active_tasks_with_active_trace') or 0)}, "
+            f"unbacked={int(task_truth_summary.get('active_tasks_without_active_trace') or 0)}"
+        )
+        if linked_traces:
+            lines.append(f"- 已挂到 task 主记录的活跃 traces: {linked_traces}")
+        if any(int(value or 0) > 0 for value in orphaned_traces.values()):
+            lines.append(f"- 游离活跃 traces: {orphaned_traces}")
+        if any(int(value or 0) > 0 for value in terminal_task_traces.values()):
+            lines.append(f"- 已终态 task 下仍活跃的 traces: {terminal_task_traces}")
     if top_secretary_actions:
         lines.append(f"- 秘书动作分布: {top_secretary_actions}")
     if top_executor_overrides:
@@ -180,6 +185,8 @@ def build_report(snapshot: dict[str, Any], *, limit: int = 8) -> str:
         lines.append(f"- 失败分类分布: {failure_kinds}")
     if delivery_statuses:
         lines.append(f"- 投递状态分布: {delivery_statuses}")
+    if delivery_platforms:
+        lines.append(f"- 投递失败平台: {delivery_platforms}")
     if dispatch_actions:
         lines.append(f"- 调度动作分布: {dispatch_actions}")
     derived_signals = snapshot.get("derived_signals") if isinstance(snapshot.get("derived_signals"), list) else []

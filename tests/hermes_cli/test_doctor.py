@@ -49,6 +49,102 @@ class TestProviderEnvDetection:
         assert not _has_provider_env_config(content)
 
 
+def test_build_task_runtime_diagnostics_collects_platform_delivery_health(monkeypatch):
+    monkeypatch.setattr(
+        "agent.operational_task_board_service.build_operational_task_snapshot",
+        lambda limit=5: {
+            "task_truth_summary": {
+                "active_tasks": 2,
+                "active_tasks_with_active_trace": 1,
+                "active_tasks_without_active_trace": 1,
+                "active_task_ids_without_active_trace": ["task-2"],
+                "linked_active_traces": {"capability_runs": 1, "background_jobs": 0, "delegation_tasks": 0},
+                "orphaned_active_traces": {"capability_runs": 0, "background_jobs": 1, "delegation_tasks": 0},
+                "terminal_task_active_traces": {"capability_runs": 0, "background_jobs": 0, "delegation_tasks": 0},
+            },
+            "task_failure_summary": {
+                "failure_kinds": {"credential_failed": 2},
+                "delivery_statuses": {"failed": 2},
+                "dispatch_actions": {"retry_delivery": 2},
+                "delivery_platforms": {"feishu": 2},
+            },
+        },
+    )
+    feishu_cfg = SimpleNamespace(
+        enabled=True,
+        token=None,
+        api_key=None,
+        extra={"app_id": "***", "app_secret": "***"},
+    )
+    home = SimpleNamespace(chat_id="oc_home")
+    monkeypatch.setattr(
+        "gateway.config.load_gateway_config",
+        lambda: SimpleNamespace(
+            get_delivery_platform_config=lambda platform: feishu_cfg,
+            get_delivery_home_channel=lambda platform: home,
+        ),
+    )
+
+    diagnostics = doctor._build_task_runtime_diagnostics(limit=4)
+
+    assert diagnostics["snapshot_ok"] is True
+    assert diagnostics["task_truth_summary"]["active_tasks_without_active_trace"] == 1
+    assert diagnostics["task_failure_summary"]["delivery_platforms"] == {"feishu": 2}
+    assert diagnostics["platforms"]["feishu"] == {
+        "affected_tasks": 2,
+        "configured": True,
+        "credentials_ready": True,
+        "home_ready": True,
+    }
+
+
+def test_check_task_runtime_health_reports_task_truth_and_trace_drift(monkeypatch, capsys):
+    monkeypatch.setattr(
+        doctor,
+        "_build_task_runtime_diagnostics",
+        lambda limit=6: {
+            "snapshot_ok": True,
+            "snapshot_error": "",
+            "task_truth_summary": {
+                "active_tasks": 3,
+                "active_tasks_with_active_trace": 1,
+                "active_tasks_without_active_trace": 2,
+                "active_task_ids_without_active_trace": ["task-2", "task-3"],
+                "linked_active_traces": {"capability_runs": 1, "background_jobs": 0, "delegation_tasks": 0},
+                "orphaned_active_traces": {"capability_runs": 0, "background_jobs": 2, "delegation_tasks": 1},
+                "terminal_task_active_traces": {"capability_runs": 0, "background_jobs": 1, "delegation_tasks": 0},
+            },
+            "task_failure_summary": {
+                "failure_kinds": {"routing_failed": 1},
+                "delivery_statuses": {"failed": 1},
+                "dispatch_actions": {"retry_delivery": 1},
+                "delivery_platforms": {"feishu": 1},
+            },
+            "platforms": {
+                "feishu": {
+                    "affected_tasks": 1,
+                    "configured": False,
+                    "credentials_ready": False,
+                    "home_ready": False,
+                }
+            },
+            "platform_error": "",
+        },
+    )
+
+    issues = []
+    doctor._check_task_runtime_health(issues)
+
+    out = capsys.readouterr().out
+    assert "Task Runtime" in out
+    assert "Task truth summary" in out
+    assert "Active tasks without active traces" in out
+    assert "Orphaned active traces detected" in out
+    assert "Terminal tasks still have active traces" in out
+    assert "feishu delivery config" in out
+    assert len(issues) == 4
+
+
 def test_run_doctor_accepts_codex_auth_without_provider_env(monkeypatch, tmp_path):
     project_root = tmp_path / "project"
     hermes_home = tmp_path / ".hermes"

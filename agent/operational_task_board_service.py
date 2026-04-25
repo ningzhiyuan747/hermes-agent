@@ -15,6 +15,7 @@ ACTIVE_TASK_STATUSES = {"open", "queued", "running", "pending_approval", "blocke
 ACTIVE_RUN_STATUSES = {"queued", "running", "pending_approval", "blocked", "paused"}
 ACTIVE_JOB_STATUSES = {"queued", "running", "paused", "blocked"}
 ACTIVE_SUBAGENT_STATUSES = {"created", "running"}
+TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def _contains(text: Any, needle: str) -> bool:
@@ -82,6 +83,109 @@ def _status_counts(rows: list[dict[str, Any]], key: str = "status") -> dict[str,
 def _top_nonempty_counts(values: list[str], *, limit: int = 5) -> dict[str, int]:
     counter = Counter(str(value or "").strip() for value in values if str(value or "").strip())
     return dict(counter.most_common(max(1, limit)))
+
+
+def _task_id_from_scope_key(task_scope_key: str) -> str:
+    normalized = str(task_scope_key or "").strip()
+    if normalized.startswith("task:"):
+        return normalized.split(":", 1)[1].strip()
+    return ""
+
+
+def _task_failure_summary(*, task_units: list[dict[str, Any]], limit: int) -> dict[str, dict[str, int]]:
+    return {
+        "failure_kinds": _top_nonempty_counts([str(unit.get("failure_kind") or "") for unit in task_units], limit=limit),
+        "delivery_statuses": _top_nonempty_counts([str(unit.get("delivery_status") or "") for unit in task_units], limit=limit),
+        "dispatch_actions": _top_nonempty_counts([str(unit.get("dispatch_action") or "") for unit in task_units], limit=limit),
+        "delivery_platforms": _top_nonempty_counts(
+            [
+                str(unit.get("origin_platform") or "")
+                for unit in task_units
+                if str(unit.get("delivery_status") or "").strip().lower() == "failed"
+                or str(unit.get("failure_kind") or "").strip().lower() in {"credential_failed", "routing_failed", "delivery_failed"}
+            ],
+            limit=limit,
+        ),
+    }
+
+
+def _task_truth_summary(
+    *,
+    task_units: list[dict[str, Any]],
+    run_units: list[dict[str, Any]],
+    job_units: list[dict[str, Any]],
+    subagent_units: list[dict[str, Any]],
+    limit: int,
+) -> dict[str, Any]:
+    task_status_by_id = {
+        str(unit.get("related_ids", {}).get("task_id") or "").strip(): str(unit.get("status") or "").strip().lower()
+        for unit in task_units
+        if str(unit.get("related_ids", {}).get("task_id") or "").strip()
+    }
+    active_task_ids = {
+        str(unit.get("related_ids", {}).get("task_id") or "").strip()
+        for unit in task_units
+        if str(unit.get("related_ids", {}).get("task_id") or "").strip() and bool(unit.get("is_active"))
+    }
+    run_task_ids = {
+        str(unit.get("related_ids", {}).get("run_id") or "").strip(): str(unit.get("related_ids", {}).get("task_id") or "").strip()
+        for unit in run_units
+        if str(unit.get("related_ids", {}).get("run_id") or "").strip()
+    }
+
+    trace_buckets = {
+        "capability_runs": [
+            unit for unit in run_units if str(unit.get("status") or "").strip().lower() in ACTIVE_RUN_STATUSES
+        ],
+        "background_jobs": [
+            unit for unit in job_units if str(unit.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES
+        ],
+        "delegation_tasks": [
+            unit for unit in subagent_units if str(unit.get("status") or "").strip().lower() in ACTIVE_SUBAGENT_STATUSES
+        ],
+    }
+    linked_active = {key: 0 for key in trace_buckets}
+    orphaned = {key: 0 for key in trace_buckets}
+    terminal_task_traces = {key: 0 for key in trace_buckets}
+    active_task_ids_with_trace: set[str] = set()
+
+    def _linked_task_id(unit_type: str, unit: dict[str, Any]) -> str:
+        related = unit.get("related_ids") if isinstance(unit.get("related_ids"), dict) else {}
+        if unit_type == "capability_runs":
+            return str(related.get("task_id") or "").strip() or _task_id_from_scope_key(str(unit.get("task_scope_key") or "").strip())
+        if unit_type == "background_jobs":
+            run_id = str(related.get("capability_run_id") or "").strip()
+            return run_task_ids.get(run_id, "") or _task_id_from_scope_key(str(unit.get("task_scope_key") or "").strip())
+        if unit_type == "delegation_tasks":
+            return str(related.get("control_task_id") or "").strip() or _task_id_from_scope_key(str(unit.get("task_scope_key") or "").strip())
+        return ""
+
+    for bucket_name, trace_units in trace_buckets.items():
+        for unit in trace_units:
+            task_id = _linked_task_id(bucket_name, unit)
+            task_status = task_status_by_id.get(task_id, "")
+            if not task_id or not task_status:
+                orphaned[bucket_name] += 1
+                continue
+            if task_status in ACTIVE_TASK_STATUSES:
+                linked_active[bucket_name] += 1
+                active_task_ids_with_trace.add(task_id)
+                continue
+            if task_status in TERMINAL_TASK_STATUSES:
+                terminal_task_traces[bucket_name] += 1
+                continue
+            orphaned[bucket_name] += 1
+
+    active_tasks_without_trace = sorted(active_task_ids - active_task_ids_with_trace)
+    return {
+        "active_tasks": len(active_task_ids),
+        "active_tasks_with_active_trace": len(active_task_ids_with_trace),
+        "active_tasks_without_active_trace": len(active_tasks_without_trace),
+        "active_task_ids_without_active_trace": active_tasks_without_trace[: max(1, limit)],
+        "linked_active_traces": linked_active,
+        "orphaned_active_traces": orphaned,
+        "terminal_task_active_traces": terminal_task_traces,
+    }
 
 
 def _follow_up_cooldown_seconds() -> int:
@@ -514,6 +618,14 @@ def build_operational_task_snapshot(*, limit: int = 20) -> dict[str, Any]:
     units = task_units + run_units + job_units + subagent_units
     units.sort(key=lambda item: (-int(item.get("updated_at_unix") or 0), -int(item.get("priority_hint") or 0), item.get("unit_id") or ""))
     scoped_units = [unit for unit in units if unit.get("task_scope_key") or unit.get("person_memory_key")]
+    task_truth_summary = _task_truth_summary(
+        task_units=task_units,
+        run_units=run_units,
+        job_units=job_units,
+        subagent_units=subagent_units,
+        limit=limit,
+    )
+    task_failure_summary = _task_failure_summary(task_units=task_units, limit=limit)
 
     return {
         "generated_at_unix": int(time.time()),
@@ -535,6 +647,8 @@ def build_operational_task_snapshot(*, limit: int = 20) -> dict[str, Any]:
             "operator_resolutions": _top_nonempty_counts([str(unit.get("last_operator_resolution") or "") for unit in task_units], limit=limit),
         },
         "derived_signals": _derive_system_signals(runs=runs, jobs=jobs),
+        "task_truth_summary": task_truth_summary,
+        "task_failure_summary": task_failure_summary,
         "reconcile_summary": reconcile_summary,
         "tasks": tasks,
         "capability_runs": runs,
