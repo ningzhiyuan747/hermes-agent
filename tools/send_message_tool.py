@@ -127,6 +127,31 @@ async def _send_telegram_message_with_retry(bot, *, attempts: int = 3, **kwargs)
             await asyncio.sleep(delay)
 
 
+def _get_delivery_platform_config(config, platform):
+    if hasattr(config, "get_delivery_platform_config"):
+        return config.get_delivery_platform_config(platform)
+
+    pconfig = getattr(config, "platforms", {}).get(platform)
+    try:
+        from gateway.platform_config_resolver import resolve_profile_backed_platform_config
+
+        return resolve_profile_backed_platform_config(platform, pconfig)
+    except Exception:
+        return pconfig
+
+
+def _get_delivery_home_channel(config, platform, pconfig=None):
+    if hasattr(config, "get_delivery_home_channel"):
+        return config.get_delivery_home_channel(platform)
+    if hasattr(config, "get_home_channel"):
+        home = config.get_home_channel(platform)
+        if home:
+            return home
+    if pconfig is not None:
+        return getattr(pconfig, "home_channel", None)
+    return None
+
+
 SEND_MESSAGE_SCHEMA = {
     "name": "send_message",
     "description": (
@@ -248,7 +273,7 @@ def _handle_send(args):
         avail = ", ".join(platform_map.keys())
         return tool_error(f"Unknown platform: {platform_name}. Available: {avail}")
 
-    pconfig = config.platforms.get(platform)
+    pconfig = _get_delivery_platform_config(config, platform)
     if (not pconfig or not pconfig.enabled) and platform == Platform.DINGTALK:
         client_id = _shared_dingtalk_credential("DINGTALK_CLIENT_ID")
         client_secret = _shared_dingtalk_credential("DINGTALK_CLIENT_SECRET")
@@ -264,7 +289,7 @@ def _handle_send(args):
 
     used_home_channel = False
     if not chat_id:
-        home = config.get_home_channel(platform)
+        home = _get_delivery_home_channel(config, platform, pconfig=pconfig)
         if home:
             chat_id = home.chat_id
             used_home_channel = True

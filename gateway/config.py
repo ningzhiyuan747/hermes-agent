@@ -318,6 +318,24 @@ class GatewayConfig:
         if config:
             return config.home_channel
         return None
+
+    def get_delivery_platform_config(self, platform: Platform) -> Optional[PlatformConfig]:
+        """Resolve the config used for outbound delivery to a platform.
+
+        This may augment the in-memory root config with profile-backed delivery
+        credentials when the current Hermes home does not own the platform's
+        live connection profile.
+        """
+        from .platform_config_resolver import resolve_profile_backed_platform_config
+
+        return resolve_profile_backed_platform_config(platform, self.platforms.get(platform))
+
+    def get_delivery_home_channel(self, platform: Platform) -> Optional[HomeChannel]:
+        """Resolve the home channel used for outbound delivery."""
+        config = self.get_delivery_platform_config(platform)
+        if config:
+            return config.home_channel
+        return None
     
     def get_reset_policy(
         self, 

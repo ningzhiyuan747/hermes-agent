@@ -31,6 +31,10 @@ def _make_config():
     ), telegram_cfg
 
 
+def _make_empty_config():
+    return SimpleNamespace(platforms={}, get_home_channel=lambda _platform: None)
+
+
 def _install_telegram_mock(monkeypatch, bot):
     parse_mode = SimpleNamespace(MARKDOWN_V2="MarkdownV2", HTML="HTML")
     constants_mod = SimpleNamespace(ParseMode=parse_mode)
@@ -64,6 +68,87 @@ def _ensure_slack_mock(monkeypatch):
 
 
 class TestSendMessageTool:
+    def test_feishu_send_uses_profile_env_when_root_home_lacks_credentials(self, tmp_path):
+        profile_env = tmp_path / "profiles" / "feishu" / ".env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text(
+            "\n".join(
+                [
+                    "FEISHU_APP_ID=cli-app-id",
+                    "FEISHU_APP_SECRET=cli-app-secret",
+                    "FEISHU_DOMAIN=feishu",
+                    "FEISHU_CONNECTION_MODE=websocket",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config = _make_empty_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("gateway.platform_config_resolver.get_default_hermes_root", return_value=tmp_path), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu:oc_profilechat",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        send_mock.assert_awaited_once()
+        args = send_mock.await_args.args
+        assert args[0] == Platform.FEISHU
+        assert args[1].enabled is True
+        assert args[1].extra["app_id"] == "cli-app-id"
+        assert args[1].extra["app_secret"] == "cli-app-secret"
+        assert args[2] == "oc_profilechat"
+        assert args[3] == "hello"
+
+    def test_feishu_send_uses_profile_home_channel_when_target_omitted(self, tmp_path):
+        profile_env = tmp_path / "profiles" / "feishu" / ".env"
+        profile_env.parent.mkdir(parents=True)
+        profile_env.write_text(
+            "\n".join(
+                [
+                    "FEISHU_APP_ID=cli-app-id",
+                    "FEISHU_APP_SECRET=cli-app-secret",
+                    "FEISHU_HOME_CHANNEL=oc_profilehome",
+                    "FEISHU_HOME_CHANNEL_NAME=Profile Home",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        config = _make_empty_config()
+
+        with patch("gateway.config.load_gateway_config", return_value=config), \
+             patch("gateway.platform_config_resolver.get_default_hermes_root", return_value=tmp_path), \
+             patch("tools.interrupt.is_interrupted", return_value=False), \
+             patch("model_tools._run_async", side_effect=_run_async_immediately), \
+             patch("tools.send_message_tool._send_to_platform", new=AsyncMock(return_value={"success": True})) as send_mock, \
+             patch("gateway.mirror.mirror_to_session", return_value=True):
+            result = json.loads(
+                send_message_tool(
+                    {
+                        "action": "send",
+                        "target": "feishu",
+                        "message": "hello",
+                    }
+                )
+            )
+
+        assert result["success"] is True
+        assert "home channel" in result["note"]
+        send_mock.assert_awaited_once()
+        args = send_mock.await_args.args
+        assert args[0] == Platform.FEISHU
+        assert args[2] == "oc_profilehome"
+
     def test_cron_duplicate_target_is_skipped_and_explained(self):
         home = SimpleNamespace(chat_id="-1001")
         config, _telegram_cfg = _make_config()

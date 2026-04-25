@@ -53,6 +53,35 @@ class TestPlatformConfigRoundtrip:
         assert restored.token is None
 
 
+class TestDeliveryPlatformResolution:
+    def test_get_delivery_platform_config_uses_profile_backed_resolver(self):
+        config = GatewayConfig()
+        resolved = PlatformConfig(enabled=True, extra={"app_id": "resolved-app", "app_secret": "resolved-secret"})
+
+        with patch(
+            "gateway.platform_config_resolver.resolve_profile_backed_platform_config",
+            return_value=resolved,
+        ) as resolver_mock:
+            actual = config.get_delivery_platform_config(Platform.FEISHU)
+
+        assert actual is resolved
+        resolver_mock.assert_called_once_with(Platform.FEISHU, None)
+
+    def test_get_delivery_home_channel_uses_resolved_delivery_config(self):
+        home = HomeChannel(platform=Platform.FEISHU, chat_id="oc_home", name="Profile Home")
+        config = GatewayConfig()
+
+        with patch.object(
+            config,
+            "get_delivery_platform_config",
+            return_value=PlatformConfig(enabled=True, home_channel=home),
+        ) as config_mock:
+            actual = config.get_delivery_home_channel(Platform.FEISHU)
+
+        assert actual is home
+        config_mock.assert_called_once_with(Platform.FEISHU)
+
+
 class TestGetConnectedPlatforms:
     def test_returns_enabled_with_token(self):
         config = GatewayConfig(
