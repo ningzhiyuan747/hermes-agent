@@ -11,7 +11,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from hermes_constants import get_hermes_home
+from hermes_cli.env_loader import load_hermes_dotenv
 from agent.background_jobs import get_job, recent_events, render_jobs_status
+
+
+_HERMES_HOME = get_hermes_home()
+load_hermes_dotenv(hermes_home=_HERMES_HOME, project_env=REPO_ROOT / ".env")
 
 
 def render_one(job_id: str, limit: int) -> str:

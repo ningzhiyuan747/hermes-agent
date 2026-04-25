@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import time
 from typing import Any, Dict
@@ -17,6 +18,10 @@ from agent.business_db import (
     update_capability_run,
 )
 from scripts.subagent_task_status import _load_task_meta
+
+
+_ACTIVE_RUN_STATUSES = {"queued", "running"}
+_TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
 
 
 def _job_tag_value(tags: list[str], prefix: str) -> str:
@@ -73,6 +78,112 @@ def _parse_person_memory_key(person_memory_key: str) -> tuple[str, str]:
 
 def _upsert_meta_file(path: Path, row: dict[str, Any]) -> None:
     path.write_text(json.dumps(row, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _pid_exists(pid: int) -> bool:
+    normalized = int(pid or 0)
+    if normalized <= 0:
+        return False
+    try:
+        os.kill(normalized, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _stale_running_job_threshold_seconds() -> int:
+    return max(300, int(os.getenv("HERMES_RECONCILE_STALE_RUNNING_JOB_SECONDS", "7200") or "7200"))
+
+
+def _terminal_run_status_from_job(job_status: str) -> str:
+    normalized = str(job_status or "").strip().lower()
+    if normalized in _TERMINAL_STATUSES:
+        return normalized
+    return "failed"
+
+
+def _reconcile_stale_runs_and_jobs(*, limit: int) -> tuple[int, int]:
+    now = int(time.time())
+    jobs_by_id = {
+        str(row.get("job_id") or "").strip(): row
+        for row in list_jobs(limit=max(20, limit * 4), active_only=False)
+        if str(row.get("job_id") or "").strip()
+    }
+
+    terminalized = 0
+    stale_failed = 0
+
+    for run in list_capability_runs(limit=max(20, limit * 4)):
+        run_id = str(run.get("run_id") or "").strip()
+        run_status = str(run.get("status") or "").strip().lower()
+        if run_status not in _ACTIVE_RUN_STATUSES:
+            continue
+
+        job_id = str(run.get("background_job_id") or "").strip()
+        if not job_id:
+            continue
+        job = jobs_by_id.get(job_id)
+        if not isinstance(job, dict):
+            continue
+
+        job_status = str(job.get("status") or "").strip().lower()
+        if job_status in _TERMINAL_STATUSES:
+            update_capability_run(
+                run_id,
+                status=_terminal_run_status_from_job(job_status),
+                current_focus=str(job.get("current_focus") or "").strip() or f"Background job {job_id} already finished.",
+                next_step=str(job.get("next_step") or "").strip() or "Review the background job result and continue from the task panel.",
+                blocker=(
+                    str(job.get("blocker") or "").strip()
+                    or str(job.get("delivery_error") or "").strip()
+                    if job_status == "failed"
+                    else ""
+                ),
+                result=str(job.get("result") or "").strip() if job_status == "completed" else str(run.get("result") or "").strip(),
+            )
+            terminalized += 1
+            continue
+
+        if job_status != "running":
+            continue
+
+        age_seconds = max(
+            0,
+            now - int(job.get("updated_at_unix") or job.get("started_at_unix") or job.get("created_at_unix") or 0),
+        )
+        runner_pid = int(job.get("runner_pid") or 0)
+        if age_seconds < _stale_running_job_threshold_seconds():
+            continue
+        if runner_pid > 0 and _pid_exists(runner_pid):
+            continue
+
+        stale_message = (
+            f"Background job {job_id} was left in running state, "
+            f"but runner pid {runner_pid or '-'} is no longer alive."
+        )
+        updated_job = update_job(
+            job_id,
+            status="failed",
+            current_focus="Stale running background job was terminalized during reconciliation.",
+            next_step="Retry the capability run or create a fresh background job if the work is still needed.",
+            blocker=stale_message,
+            runner_pid=None,
+            runner_runtime="",
+        ) or {}
+        update_capability_run(
+            run_id,
+            status="failed",
+            current_focus=str(updated_job.get("current_focus") or "").strip() or "Stale background job was terminalized.",
+            next_step=str(updated_job.get("next_step") or "").strip() or "Retry the capability run if the work is still needed.",
+            blocker=stale_message,
+        )
+        stale_failed += 1
+
+    return terminalized, stale_failed
 
 
 def _delegation_task_status(value: str) -> str:
@@ -391,14 +502,17 @@ def reconcile_task_records(*, limit: int = 100) -> Dict[str, Any]:
         update_job(str(row.get("job_id") or "").strip(), task_id=resolved_task_id)
         jobs_linked += 1
 
+    runs_terminalized, jobs_failed = _reconcile_stale_runs_and_jobs(limit=max(1, int(limit or 100)))
     delegations_scanned, delegations_linked = _reconcile_delegation_records(limit=max(1, int(limit or 100)))
     tasks_scanned, tasks_terminalized = _reconcile_task_terminal_states(limit=max(1, int(limit or 100)))
 
     return {
         "runs_scanned": runs_scanned,
         "runs_linked": runs_linked,
+        "runs_terminalized": runs_terminalized,
         "jobs_scanned": jobs_scanned,
         "jobs_linked": jobs_linked,
+        "jobs_failed": jobs_failed,
         "delegations_scanned": delegations_scanned,
         "delegations_linked": delegations_linked,
         "tasks_scanned": tasks_scanned,

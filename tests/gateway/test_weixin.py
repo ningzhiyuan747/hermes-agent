@@ -14,6 +14,7 @@ from gateway.platforms.base import MessageType
 from gateway.platforms.weixin import (
     ContextTokenStore,
     WeixinAdapter,
+    WeixinAPIError,
     normalize_weixin_gateway_command_text,
 )
 from tools.send_message_tool import _parse_target_ref, _send_to_platform
@@ -128,6 +129,77 @@ class TestWeixinGatewayCommandNormalization:
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
         assert event.text == "/stop"
+        assert event.message_type == MessageType.COMMAND
+
+    @pytest.mark.asyncio
+    async def test_process_message_keeps_long_dm_in_foreground_by_default(self):
+        adapter = _make_adapter()
+        adapter._session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._maybe_fetch_typing_ticket = AsyncMock()
+
+        message = {
+            "message_id": "msg-2",
+            "from_user_id": "wxid_user_2",
+            "to_user_id": adapter._account_id,
+            "msg_type": 1,
+            "context_token": "ctx-2",
+            "item_list": [
+                {
+                    "type": weixin.ITEM_TEXT,
+                    "text_item": {"text": "帮我研究一下这家公司近三年的招投标和合同情况，整理成报告"},
+                }
+            ],
+        }
+
+        await adapter._process_message(message)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert not event.text.startswith("/background ")
+        assert "招投标和合同情况" in event.text
+        assert event.message_type == MessageType.TEXT
+
+    @pytest.mark.asyncio
+    async def test_process_message_routes_long_dm_work_to_background_when_enabled(self):
+        adapter = WeixinAdapter(
+            PlatformConfig(
+                enabled=True,
+                token="test-token",
+                extra={
+                    "account_id": "test-account",
+                    "dm_policy": "open",
+                    "allow_from": [],
+                    "group_policy": "disabled",
+                    "group_allow_from": [],
+                    "auto_background_routing": True,
+                },
+            )
+        )
+        adapter._session = object()
+        adapter.handle_message = AsyncMock()
+        adapter._maybe_fetch_typing_ticket = AsyncMock()
+
+        message = {
+            "message_id": "msg-2",
+            "from_user_id": "wxid_user_2",
+            "to_user_id": adapter._account_id,
+            "msg_type": 1,
+            "context_token": "ctx-2",
+            "item_list": [
+                {
+                    "type": weixin.ITEM_TEXT,
+                    "text_item": {"text": "帮我研究一下这家公司近三年的招投标和合同情况，整理成报告"},
+                }
+            ],
+        }
+
+        await adapter._process_message(message)
+
+        adapter.handle_message.assert_awaited_once()
+        event = adapter.handle_message.await_args.args[0]
+        assert event.text.startswith("/background ")
+        assert "招投标和合同情况" in event.text
         assert event.message_type == MessageType.COMMAND
 
 
@@ -261,6 +333,7 @@ class TestWeixinConfig:
                 "WEIXIN_CDN_BASE_URL": "https://cdn.example.com/c2c/",
                 "WEIXIN_DM_POLICY": "allowlist",
                 "WEIXIN_SPLIT_MULTILINE_MESSAGES": "true",
+                "WEIXIN_AUTO_BACKGROUND_ROUTING": "true",
                 "WEIXIN_ALLOWED_USERS": "wxid_1,wxid_2",
                 "WEIXIN_HOME_CHANNEL": "wxid_1",
                 "WEIXIN_HOME_CHANNEL_NAME": "Primary DM",
@@ -277,8 +350,25 @@ class TestWeixinConfig:
         assert platform_config.extra["cdn_base_url"] == "https://cdn.example.com/c2c"
         assert platform_config.extra["dm_policy"] == "allowlist"
         assert platform_config.extra["split_multiline_messages"] == "true"
+        assert platform_config.extra["auto_background_routing"] == "true"
         assert platform_config.extra["allow_from"] == "wxid_1,wxid_2"
         assert platform_config.home_channel == HomeChannel(Platform.WEIXIN, "wxid_1", "Primary DM")
+
+    def test_apply_env_overrides_captures_weixin_owner_user_ids(self):
+        config = GatewayConfig()
+
+        with patch.dict(
+            os.environ,
+            {
+                "WEIXIN_ACCOUNT_ID": "bot-account",
+                "WEIXIN_TOKEN": "bot-token",
+                "WEIXIN_OWNER_USER_IDS": "boss-1,boss-2",
+            },
+            clear=True,
+        ):
+            _apply_env_overrides(config)
+
+        assert config.platforms[Platform.WEIXIN].extra["owner_user_ids"] == "boss-1,boss-2"
 
     def test_get_connected_platforms_includes_weixin_with_token(self):
         config = GatewayConfig(
@@ -398,6 +488,37 @@ class TestWeixinSendMessageIntegration:
             "hello",
             media_files=[("/tmp/demo.png", False)],
         )
+
+
+class TestWeixinApiErrors:
+    @pytest.mark.asyncio
+    async def test_api_post_raises_on_business_error_payload(self):
+        class _Response:
+            ok = True
+            status = 200
+
+            async def text(self):
+                return json.dumps({"ret": 1, "errcode": 43001, "errmsg": "invalid context"})
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        class _Session:
+            def post(self, *args, **kwargs):
+                return _Response()
+
+        with pytest.raises(WeixinAPIError, match="business error"):
+            await weixin._api_post(
+                _Session(),
+                base_url="https://ilink.example.com",
+                endpoint=weixin.EP_SEND_MESSAGE,
+                payload={"msg": {"client_id": "demo"}},
+                token="token",
+                timeout_ms=1000,
+            )
 
 
 class TestWeixinChunkDelivery:

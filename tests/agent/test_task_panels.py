@@ -104,7 +104,7 @@ def test_format_task_panel_snapshot_includes_recent_artifacts_with_fullwidth_col
     assert "当前 Run: contract_retrieval / running" in text
     assert "当前后台任务: job-42 / active" in text
     assert "当前子代理: ops-worker / running" in text
-    assert "待审批: 1" in text
+    assert "待业务审批: 1" in text
     assert "当前: 正在搜合同公告" in text
     assert "下一步: 等审批通过后继续抓附件" in text
     assert "阻塞: Pending approval." in text
@@ -141,7 +141,7 @@ def test_format_approval_list_text_prefers_task_scope_label():
         scope_all=False,
     )
 
-    assert text.startswith("当前任务审批列表：")
+    assert text.startswith("当前任务业务审批列表：")
     assert "任务：华东报价任务" in text
     assert "approval-123 | pending | quote_generation | 华东报价单生成" in text
 
@@ -179,7 +179,7 @@ def test_format_capability_run_snapshot_includes_task_origin_and_artifacts():
     assert "Capability： contract_retrieval" in text
     assert "Run： run-123" in text
     assert "任务： 司羿合同任务" in text
-    assert "审批ID： approval-9" in text
+    assert "业务审批ID： approval-9" in text
     assert "Task scope： feishu:chat:group-42:thread:task-9" in text
     assert "Person memory： feishu:user:user-7" in text
     assert "来源： feishu / 商务" in text

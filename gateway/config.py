@@ -290,6 +290,9 @@ class GatewayConfig:
             # Webhook uses enabled flag only (secrets are per-route)
             elif platform == Platform.WEBHOOK:
                 connected.append(platform)
+            # DingTalk uses extra dict for app credentials
+            elif platform == Platform.DINGTALK and config.extra.get("client_id") and config.extra.get("client_secret"):
+                connected.append(platform)
             # Feishu uses extra dict for app credentials
             elif platform == Platform.FEISHU and config.extra.get("app_id"):
                 connected.append(platform)
@@ -1006,6 +1009,39 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         if webhook_secret:
             config.platforms[Platform.WEBHOOK].extra["secret"] = webhook_secret
 
+    # DingTalk
+    dingtalk_client_id = os.getenv("DINGTALK_CLIENT_ID", "").strip()
+    dingtalk_client_secret = os.getenv("DINGTALK_CLIENT_SECRET", "").strip()
+    if dingtalk_client_id and dingtalk_client_secret:
+        if Platform.DINGTALK not in config.platforms:
+            config.platforms[Platform.DINGTALK] = PlatformConfig()
+        config.platforms[Platform.DINGTALK].enabled = True
+        dingtalk_extra = config.platforms[Platform.DINGTALK].extra
+        dingtalk_extra.update({
+            "client_id": dingtalk_client_id,
+            "client_secret": dingtalk_client_secret,
+        })
+        dingtalk_owner_user_ids = (
+            os.getenv("DINGTALK_OWNER_USER_IDS", "").strip()
+            or os.getenv("DINGTALK_OWNER_IDS", "").strip()
+        )
+        if dingtalk_owner_user_ids:
+            dingtalk_extra["owner_user_ids"] = [
+                item.strip()
+                for item in dingtalk_owner_user_ids.split(",")
+                if item.strip()
+            ]
+        dingtalk_home = (
+            os.getenv("DINGTALK_HOME_CHANNEL", "").strip()
+            or os.getenv("DINGTALK_PRIMARY_CHAT_ID", "").strip()
+        )
+        if dingtalk_home:
+            config.platforms[Platform.DINGTALK].home_channel = HomeChannel(
+                platform=Platform.DINGTALK,
+                chat_id=dingtalk_home,
+                name=os.getenv("DINGTALK_HOME_CHANNEL_NAME", "Home"),
+            )
+
     # Feishu / Lark
     feishu_app_id = os.getenv("FEISHU_APP_ID")
     feishu_app_secret = os.getenv("FEISHU_APP_SECRET")
@@ -1099,12 +1135,18 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
         weixin_allowed_users = os.getenv("WEIXIN_ALLOWED_USERS", "").strip()
         if weixin_allowed_users:
             extra["allow_from"] = weixin_allowed_users
+        weixin_owner_user_ids = os.getenv("WEIXIN_OWNER_USER_IDS", "").strip()
+        if weixin_owner_user_ids:
+            extra["owner_user_ids"] = weixin_owner_user_ids
         weixin_group_allowed_users = os.getenv("WEIXIN_GROUP_ALLOWED_USERS", "").strip()
         if weixin_group_allowed_users:
             extra["group_allow_from"] = weixin_group_allowed_users
         weixin_split_multiline = os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES", "").strip()
         if weixin_split_multiline:
             extra["split_multiline_messages"] = weixin_split_multiline
+        weixin_auto_background_routing = os.getenv("WEIXIN_AUTO_BACKGROUND_ROUTING", "").strip()
+        if weixin_auto_background_routing:
+            extra["auto_background_routing"] = weixin_auto_background_routing
         weixin_home = os.getenv("WEIXIN_HOME_CHANNEL", "").strip()
         if weixin_home:
             config.platforms[Platform.WEIXIN].home_channel = HomeChannel(

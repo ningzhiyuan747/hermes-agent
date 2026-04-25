@@ -5,13 +5,14 @@ import importlib
 import sys
 import time
 import types
+from datetime import datetime
 from types import SimpleNamespace
 
 import pytest
 
 from gateway.config import Platform, PlatformConfig, StreamingConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
-from gateway.session import SessionSource
+from gateway.session import SessionEntry, SessionSource
 
 
 class ProgressCaptureAdapter(BasePlatformAdapter):
@@ -111,6 +112,16 @@ def _make_runner(adapter):
         stt_enabled=False,
     )
     return runner
+
+
+def test_humanize_agent_failure_maps_provider_retry_error():
+    adapter = ProgressCaptureAdapter()
+    runner = _make_runner(adapter)
+    message = runner._humanize_agent_failure(
+        "API call failed after 3 retries. An error occurred while processing your request."
+    )
+    assert "主模型这次连续失败" in message
+    assert "/reset" in message
 
 
 @pytest.mark.asyncio
@@ -379,6 +390,22 @@ class PreviewedResponseAgent:
         }
 
 
+class InterruptedPreviewAgent:
+    def __init__(self, **kwargs):
+        self.interim_assistant_callback = kwargs.get("interim_assistant_callback")
+        self.tools = []
+
+    def run_conversation(self, message, conversation_history=None, task_id=None):
+        if self.interim_assistant_callback:
+            self.interim_assistant_callback("Let me check that for you.", already_streamed=False)
+        return {
+            "final_response": "",
+            "response_previewed": True,
+            "messages": [],
+            "api_calls": 1,
+        }
+
+
 class StreamingRefineAgent:
     def __init__(self, **kwargs):
         self.stream_delta_callback = kwargs.get("stream_delta_callback")
@@ -640,6 +667,63 @@ async def test_run_agent_previewed_final_marks_already_sent(monkeypatch, tmp_pat
 
     assert result.get("already_sent") is True
     assert [call["content"] for call in adapter.sent] == ["You're welcome."]
+
+
+@pytest.mark.asyncio
+async def test_run_agent_partial_preview_without_final_returns_error_message(monkeypatch, tmp_path):
+    adapter, result = await _run_with_agent(
+        monkeypatch,
+        tmp_path,
+        InterruptedPreviewAgent,
+        session_id="sess-interrupted-preview",
+        config_data={"display": {"interim_assistant_messages": True}},
+    )
+
+    assert result.get("failed") is True
+    assert result["final_response"].startswith("⚠️ The reply was interrupted before a complete result was produced.")
+    assert result.get("already_sent") is not True
+    assert [call["content"] for call in adapter.sent] == ["Let me check that for you."]
+
+
+def test_weixin_dm_hygiene_limits_are_more_aggressive():
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(platform=Platform.WEIXIN, chat_id="wx-user", chat_type="dm")
+
+    threshold, hard_limit = runner._session_hygiene_limits_for_source(source)
+
+    assert threshold == pytest.approx(0.60)
+    assert hard_limit == 120
+
+
+def test_weixin_dm_failed_long_session_triggers_retry_after_auto_compact():
+    gateway_run = importlib.import_module("gateway.run")
+    GatewayRunner = gateway_run.GatewayRunner
+    runner = object.__new__(GatewayRunner)
+    source = SessionSource(platform=Platform.WEIXIN, chat_id="wx-user", chat_type="dm")
+    session_entry = SessionEntry(
+        session_key="agent:main:weixin:dm:wx-user",
+        session_id="sess-1",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.WEIXIN,
+        chat_type="dm",
+        last_prompt_tokens=124188,
+    )
+    history = [{"role": "user", "content": f"m{i}"} for i in range(65)]
+    agent_result = {
+        "failed": True,
+        "error": "An error occurred while processing your request.",
+        "final_response": "",
+    }
+
+    assert runner._should_retry_after_auto_compact(
+        source=source,
+        history=history,
+        session_entry=session_entry,
+        agent_result=agent_result,
+    ) is True
 
 
 @pytest.mark.asyncio

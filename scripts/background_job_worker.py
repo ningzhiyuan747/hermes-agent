@@ -16,6 +16,7 @@ import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 import re
 from pathlib import Path
@@ -760,13 +761,51 @@ def run_one(timeout: int, executor: str) -> bool:
     return True
 
 
+def _worker_loop(*, stop_event: threading.Event, timeout: int, executor: str, interval: int) -> None:
+    sleep_seconds = max(1, int(interval))
+    while not stop_event.is_set():
+        ran = run_one(timeout=timeout, executor=executor)
+        if not ran:
+            stop_event.wait(sleep_seconds)
+
+
+def _run_once_batch(*, timeout: int, executor: str, concurrency: int) -> bool:
+    normalized = max(1, int(concurrency))
+    if normalized <= 1:
+        return run_one(timeout=timeout, executor=executor)
+
+    results: list[bool] = []
+    threads: list[threading.Thread] = []
+    results_guard = threading.Lock()
+
+    def _runner() -> None:
+        result = run_one(timeout=timeout, executor=executor)
+        with results_guard:
+            results.append(bool(result))
+
+    for index in range(normalized):
+        thread = threading.Thread(target=_runner, name=f"background-job-once-{index + 1}")
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    return any(results)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Run queued Hermes background jobs.")
     parser.add_argument("--once", action="store_true", help="Run at most one queued job and exit.")
     parser.add_argument("--interval", type=int, default=15, help="Loop sleep seconds.")
     parser.add_argument("--timeout", type=int, default=int(os.getenv("HERMES_BACKGROUND_JOB_TIMEOUT", "3600")), help="Per-job timeout seconds.")
     parser.add_argument("--executor", default=os.getenv("HERMES_BACKGROUND_JOB_EXECUTOR", "background-job-worker"), help="Executor name.")
+    parser.add_argument(
+        "--concurrency",
+        type=int,
+        default=max(1, int(os.getenv("HERMES_BACKGROUND_JOB_CONCURRENCY", "1") or "1")),
+        help="Number of concurrent worker loops to run in this process.",
+    )
     args = parser.parse_args()
+    concurrency = max(1, int(args.concurrency or 1))
     distill_enabled = str(os.getenv("HERMES_USER_PROFILE_DISTILL_ENABLED", "true") or "true").strip().lower() in {"1", "true", "yes", "on"}
     distill_interval = max(300, int(os.getenv("HERMES_USER_PROFILE_DISTILL_INTERVAL_SECONDS", "21600") or "21600"))
     distill_platform = str(os.getenv("HERMES_USER_PROFILE_DISTILL_PLATFORM", "dingtalk") or "dingtalk").strip().lower()
@@ -776,10 +815,36 @@ def main() -> int:
     last_distill_at = 0.0
 
     if args.once:
-        return 0 if run_one(timeout=args.timeout, executor=args.executor) else 2
+        return 0 if _run_once_batch(timeout=args.timeout, executor=args.executor, concurrency=concurrency) else 2
 
-    while True:
-        ran = run_one(timeout=args.timeout, executor=args.executor)
+    stop_event = threading.Event()
+
+    def _request_stop(_signum=None, _frame=None) -> None:
+        stop_event.set()
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            signal.signal(sig, _request_stop)
+        except Exception:
+            pass
+
+    threads: list[threading.Thread] = []
+    for index in range(concurrency):
+        thread = threading.Thread(
+            target=_worker_loop,
+            kwargs={
+                "stop_event": stop_event,
+                "timeout": args.timeout,
+                "executor": args.executor,
+                "interval": args.interval,
+            },
+            name=f"background-job-worker-{index + 1}",
+            daemon=True,
+        )
+        thread.start()
+        threads.append(thread)
+
+    while not stop_event.wait(1.0):
         now = time.time()
         if distill_enabled and now - last_distill_at >= distill_interval:
             try:
@@ -792,8 +857,10 @@ def main() -> int:
             except Exception:
                 pass
             last_distill_at = now
-        if not ran:
-            time.sleep(max(1, args.interval))
+
+    for thread in threads:
+        thread.join(timeout=1.0)
+    return 0
 
 
 if __name__ == "__main__":

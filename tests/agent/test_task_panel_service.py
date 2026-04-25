@@ -52,6 +52,49 @@ def test_get_task_panel_snapshot_aggregates_run_job_approval_and_artifacts(monke
     assert snapshot["control_summary"]["task_scope_key"] == ""
 
 
+def test_get_task_panel_snapshot_ignores_non_pending_approvals(monkeypatch):
+    monkeypatch.setattr(
+        service,
+        "get_task",
+        lambda task_id: {
+            "task_id": task_id,
+            "title": "任务 A",
+            "status": "open",
+            "goal": "完成任务 A",
+        },
+    )
+    monkeypatch.setattr(
+        service,
+        "list_capability_runs",
+        lambda task_id="", limit=0: [
+            {
+                "run_id": "run-1",
+                "status": "cancelled",
+                "background_job_id": "",
+                "task_id": task_id,
+                "capability_name": "contract_retrieval",
+                "blocker": "Approval cancelled.",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        service,
+        "list_approvals",
+        lambda status="", limit=0: [],
+    )
+    monkeypatch.setattr(service, "get_job", lambda job_id: None)
+    monkeypatch.setattr(service, "list_jobs", lambda limit=0, active_only=False: [])
+    monkeypatch.setattr(service, "list_capability_artifacts", lambda run_id, limit=0: [])
+
+    snapshot = service.get_task_panel_snapshot("task-1", active_only=False)
+
+    assert snapshot is not None
+    assert snapshot["approvals"] == []
+    assert snapshot["control_summary"]["status"] == "cancelled"
+    assert snapshot["control_summary"]["pending_approval_count"] == 0
+    assert snapshot["control_summary"]["dispatch_action"] != "wait_approval"
+
+
 def test_sync_task_control_state_writes_derived_status_and_metadata(monkeypatch):
     monkeypatch.setattr(
         service,

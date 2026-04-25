@@ -66,6 +66,14 @@ from gateway.platforms.base import (
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
+try:
+    from agent.business_db import get_channel, get_user, upsert_channel, upsert_user
+except Exception:  # pragma: no cover - business DB must not break adapter import
+    get_channel = None  # type: ignore[assignment]
+    get_user = None  # type: ignore[assignment]
+    upsert_channel = None  # type: ignore[assignment]
+    upsert_user = None  # type: ignore[assignment]
+
 ILINK_BASE_URL = "https://ilinkai.weixin.qq.com"
 WEIXIN_CDN_BASE_URL = "https://novac2c.cdn.weixin.qq.com/c2c"
 ILINK_APP_ID = "bot"
@@ -153,6 +161,47 @@ _WEIXIN_PREFIX_COMMAND_ALIASES = (
     ("催一下", "/follow-up"),
     ("提醒一下", "/follow-up"),
 )
+_WEIXIN_BACKGROUND_HINT_KEYWORDS = {
+    "查",
+    "搜索",
+    "检索",
+    "研究",
+    "调研",
+    "分析",
+    "整理",
+    "总结",
+    "汇总",
+    "比对",
+    "对比",
+    "报告",
+    "合同",
+    "招标",
+    "投标",
+    "标书",
+    "报价",
+    "参数表",
+    "需求表",
+    "research",
+    "search",
+    "find",
+    "analyze",
+    "analyse",
+    "summary",
+    "summarize",
+    "compare",
+    "contract",
+    "tender",
+    "bid",
+    "report",
+}
+
+
+class WeixinAPIError(RuntimeError):
+    """Structured iLink API error with retryability metadata."""
+
+    def __init__(self, message: str, *, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = bool(retryable)
 
 
 def check_weixin_requirements() -> bool:
@@ -413,8 +462,18 @@ async def _api_post(
     async with session.post(url, data=body, headers=_headers(token, body), timeout=timeout) as response:
         raw = await response.text()
         if not response.ok:
-            raise RuntimeError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}")
-        return json.loads(raw)
+            raise WeixinAPIError(f"iLink POST {endpoint} HTTP {response.status}: {raw[:200]}", retryable=response.status >= 500)
+        data = json.loads(raw)
+        ret = data.get("ret", 0)
+        errcode = data.get("errcode", 0)
+        if ret not in (0, None) or errcode not in (0, None):
+            errmsg = str(data.get("errmsg") or data.get("msg") or "").strip()
+            code = errcode if errcode not in (0, None, "") else ret
+            raise WeixinAPIError(
+                f"iLink POST {endpoint} business error ret={ret} errcode={errcode} errmsg={errmsg or '-'}",
+                retryable=int(code) == SESSION_EXPIRED_ERRCODE,
+            )
+        return data
 
 
 async def _api_get(
@@ -957,6 +1016,27 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     return ""
 
 
+def _should_route_to_background(
+    text: str,
+    *,
+    media_paths: List[str],
+    chat_type: str,
+    enabled: bool,
+) -> bool:
+    if not enabled:
+        return False
+    normalized_chat_type = str(chat_type or "").strip().lower()
+    raw = str(text or "").strip()
+    if normalized_chat_type != "dm" or not raw or raw.startswith("/"):
+        return False
+    lowered = raw.lower()
+    if media_paths:
+        return True
+    if len(raw) >= 120 or raw.count("\n") >= 2:
+        return True
+    return any(keyword in lowered for keyword in _WEIXIN_BACKGROUND_HINT_KEYWORDS)
+
+
 def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
     if any(m.startswith("image/") for m in media_types):
         return MessageType.PHOTO
@@ -1153,16 +1233,27 @@ class WeixinAdapter(BasePlatformAdapter):
         allow_from = extra.get("allow_from")
         if allow_from is None:
             allow_from = os.getenv("WEIXIN_ALLOWED_USERS", "")
+        owner_user_ids = extra.get("owner_user_ids")
+        if owner_user_ids is None:
+            owner_user_ids = os.getenv("WEIXIN_OWNER_USER_IDS", "")
         group_allow_from = extra.get("group_allow_from")
         if group_allow_from is None:
             group_allow_from = os.getenv("WEIXIN_GROUP_ALLOWED_USERS", "")
         self._allow_from = self._coerce_list(allow_from)
+        self._owner_user_ids = self._coerce_list(owner_user_ids)
         self._group_allow_from = self._coerce_list(group_allow_from)
+        if not self._owner_user_ids and self._group_policy == "disabled" and self._dm_policy in {"allowlist", "pairing"}:
+            # Common control-surface setup: only owner/boss are allowlisted in private chat.
+            self._owner_user_ids = list(self._allow_from)
         self._split_multiline_messages = _coerce_bool(
             extra.get("split_multiline_messages")
             or os.getenv("WEIXIN_SPLIT_MULTILINE_MESSAGES"),
             default=False,
         )
+        auto_background_routing = extra.get("auto_background_routing")
+        if auto_background_routing is None:
+            auto_background_routing = os.getenv("WEIXIN_AUTO_BACKGROUND_ROUTING")
+        self._auto_background_routing = _coerce_bool(auto_background_routing, default=False)
         self._debug_inbound = _coerce_bool(
             extra.get("debug_inbound")
             or os.getenv("WEIXIN_DEBUG_INBOUND"),
@@ -1406,12 +1497,32 @@ class WeixinAdapter(BasePlatformAdapter):
         if not text and not media_paths:
             self._debug_log("drop inbound without text/media from sender=%s", _safe_id(sender_id, keep=18))
             return
+        if _should_route_to_background(
+            text,
+            media_paths=media_paths,
+            chat_type=chat_type,
+            enabled=self._auto_background_routing,
+        ):
+            original_text = text
+            text = f"/background {original_text}".strip()
+            self._debug_log(
+                "route inbound to background sender=%s chat=%s text_len=%d media=%d",
+                _safe_id(sender_id, keep=18),
+                _safe_id(effective_chat_id, keep=18),
+                len(original_text),
+                len(media_paths),
+            )
 
         source = self.build_source(
             chat_id=effective_chat_id,
             chat_type=chat_type,
             user_id=sender_id,
             user_name=sender_id,
+        )
+        self._sync_business_identity(
+            sender_id=sender_id,
+            effective_chat_id=effective_chat_id,
+            chat_type=chat_type,
         )
         event = MessageEvent(
             text=text,
@@ -1433,6 +1544,57 @@ class WeixinAdapter(BasePlatformAdapter):
             len(media_paths),
         )
         await self.handle_message(event)
+
+    def _sync_business_identity(self, *, sender_id: str, effective_chat_id: str, chat_type: str) -> None:
+        if upsert_user is None or upsert_channel is None:
+            return
+        try:
+            normalized_sender_id = str(sender_id or "").strip()
+            if not normalized_sender_id:
+                return
+            existing_user = (
+                get_user(platform="weixin", user_id=normalized_sender_id)
+                if get_user is not None
+                else {}
+            )
+            role = (
+                "owner"
+                if normalized_sender_id in set(self._owner_user_ids)
+                else str((existing_user or {}).get("role") or "user").strip().lower() or "user"
+            )
+            permissions = (
+                dict((existing_user or {}).get("permissions") or {})
+                if isinstance((existing_user or {}).get("permissions"), dict)
+                else {}
+            )
+            if role == "owner":
+                permissions["bypass_approval"] = True
+                permissions["global_owner"] = True
+            upsert_user(
+                platform="weixin",
+                user_id=normalized_sender_id,
+                display_name=normalized_sender_id,
+                role=role,
+                permissions=permissions,
+            )
+            existing_channel = (
+                get_channel(platform="weixin", chat_id=str(effective_chat_id or "").strip(), thread_id="")
+                if get_channel is not None
+                else {}
+            )
+            upsert_channel(
+                platform="weixin",
+                chat_id=str(effective_chat_id or "").strip(),
+                thread_id="",
+                task_id=str((existing_channel or {}).get("task_id") or "").strip(),
+                chat_name=str(effective_chat_id or "").strip(),
+                chat_type=str(chat_type or "").strip(),
+                worker_role=str((existing_channel or {}).get("worker_role") or "").strip(),
+                allow_free_chat=bool((existing_channel or {}).get("allow_free_chat")) or str(chat_type or "").strip() == "dm",
+                policy=(existing_channel or {}).get("policy") or {},
+            )
+        except Exception:
+            logger.debug("[Weixin] Failed to sync business identity", exc_info=True)
 
     def _is_dm_allowed(self, sender_id: str) -> bool:
         if self._dm_policy == "disabled":
@@ -1584,6 +1746,8 @@ class WeixinAdapter(BasePlatformAdapter):
                 return
             except Exception as exc:
                 last_error = exc
+                if isinstance(exc, WeixinAPIError) and not bool(getattr(exc, "retryable", False)):
+                    break
                 if attempt >= self._send_chunk_retries:
                     break
                 if self._is_recoverable_transport_error(exc):
@@ -1630,7 +1794,11 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            return SendResult(
+                success=False,
+                error=str(exc),
+                retryable=self._is_recoverable_transport_error(exc) or bool(getattr(exc, "retryable", False)),
+            )
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         if not self._session or not self._token:

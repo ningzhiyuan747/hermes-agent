@@ -98,13 +98,15 @@ class TestHandleBackgroundCommand:
             created_tasks.append(mock_task)
             return mock_task
 
-        with patch("gateway.run.asyncio.create_task", side_effect=capture_task):
+        with patch("agent.background_jobs.create_job", return_value={"job_id": "job-test-1"}), \
+             patch("gateway.run.asyncio.create_task", side_effect=capture_task):
             event = _make_event(text="/background Summarize the top HN stories")
             result = await runner._handle_background_command(event)
 
         assert "🔄" in result
         assert "Background task started" in result
         assert "bg_" in result  # task ID starts with bg_
+        assert "job-test-1" in result
         assert "Summarize the top HN stories" in result
         assert len(created_tasks) == 1  # background task was created
 
@@ -114,7 +116,8 @@ class TestHandleBackgroundCommand:
         runner = _make_runner()
         long_prompt = "A" * 100
 
-        with patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
+        with patch("agent.background_jobs.create_job", return_value={"job_id": "job-test-2"}), \
+             patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
             event = _make_event(text=f"/background {long_prompt}")
             result = await runner._handle_background_command(event)
 
@@ -128,7 +131,8 @@ class TestHandleBackgroundCommand:
         runner = _make_runner()
         task_ids = set()
 
-        with patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
+        with patch("agent.background_jobs.create_job", return_value={"job_id": "job-test-3"}), \
+             patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
             for i in range(5):
                 event = _make_event(text=f"/background task {i}")
                 result = await runner._handle_background_command(event)
@@ -145,7 +149,8 @@ class TestHandleBackgroundCommand:
         """The /background command works for all platforms."""
         for platform in [Platform.TELEGRAM, Platform.DISCORD, Platform.SLACK]:
             runner = _make_runner()
-            with patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
+            with patch("agent.background_jobs.create_job", return_value={"job_id": "job-test-platform"}), \
+                 patch("gateway.run.asyncio.create_task", side_effect=lambda c, **kw: (c.close(), MagicMock())[1]):
                 event = _make_event(
                     text="/background test task",
                     platform=platform,

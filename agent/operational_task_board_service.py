@@ -141,6 +141,7 @@ def _build_scope_fields(
 def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
     origin = row.get("origin") if isinstance(row.get("origin"), dict) else {}
     run_id = str(row.get("run_id") or "").strip()
+    session_id = str(row.get("session_id") or "").strip()
     actor_user_id = str(row.get("actor_user_id") or "").strip()
     task_id = str(row.get("task_id") or "").strip()
     scopes = _build_scope_fields(origin=origin, actor_user_id=actor_user_id, task_id=task_id)
@@ -158,6 +159,7 @@ def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
         "priority_hint": 100 if str(row.get("status") or "").strip().lower() in ACTIVE_RUN_STATUSES else 10,
         "related_ids": {
             "run_id": run_id,
+            "session_id": session_id,
             "task_id": task_id,
             "background_job_id": str(row.get("background_job_id") or "").strip(),
             "approval_id": str(row.get("approval_id") or "").strip(),
@@ -169,6 +171,7 @@ def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
 
 def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
     task_id = str(row.get("task_id") or "").strip()
+    source_session_id = str(row.get("source_session_id") or "").strip()
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
     control_plane = metadata.get("control_plane") if isinstance(metadata.get("control_plane"), dict) else {}
     origin = {
@@ -250,8 +253,10 @@ def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
         "is_active": is_active,
         "related_ids": {
             "task_id": task_id,
-            "source_session_id": str(row.get("source_session_id") or "").strip(),
+            "source_session_id": source_session_id,
+            "owner_user_id": str(row.get("owner_user_id") or "").strip(),
             "source_chat_id": str(row.get("source_chat_id") or "").strip(),
+            "source_thread_id": str(row.get("source_thread_id") or "").strip(),
         },
         "task_scope_key": task_scope_key,
         "person_memory_key": person_memory_key,
@@ -277,6 +282,7 @@ def _job_capability_run_id(row: dict[str, Any]) -> str:
 
 def _job_unit(row: dict[str, Any]) -> dict[str, Any]:
     job_id = str(row.get("job_id") or "").strip()
+    session_id = str(row.get("session_id") or row.get("user_id") or "").strip()
     task_scope_key = _job_tag_value(row, "task_scope")
     person_memory_key = _job_tag_value(row, "person_memory")
     if task_scope_key.startswith("dingtalk:chat:"):
@@ -293,7 +299,7 @@ def _job_unit(row: dict[str, Any]) -> dict[str, Any]:
         "title": str(row.get("title") or "").strip(),
         "status": str(row.get("status") or "unknown").strip().lower(),
         "delivery_status": str(row.get("delivery_status") or "").strip().lower(),
-        "owner": str(row.get("session_id") or row.get("user_id") or "").strip(),
+        "owner": session_id,
         "origin_platform": task_scope_key.split(":", 1)[0] if ":" in task_scope_key else "",
         "current_focus": str(row.get("current_focus") or "").strip(),
         "next_step": str(row.get("next_step") or "").strip(),
@@ -302,6 +308,7 @@ def _job_unit(row: dict[str, Any]) -> dict[str, Any]:
         "priority_hint": 80 if str(row.get("status") or "").strip().lower() in ACTIVE_JOB_STATUSES else 20,
         "related_ids": {
             "job_id": job_id,
+            "session_id": session_id,
             "capability_run_id": _job_capability_run_id(row),
             "executor": str(row.get("executor") or "").strip(),
         },

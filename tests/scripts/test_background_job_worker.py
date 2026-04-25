@@ -180,3 +180,28 @@ def test_run_one_syncs_capability_run_on_background_job_completion(monkeypatch):
     ]
     assert deliveries == [{"record": {"job_id": "job-123", "status": "completed", "current_focus": "Background job completed.", "next_step": "Review the stored result; delivery to the originating chat has been attempted when available.", "result": "done"}, "failed": False}]
     assert released == ["job-123"]
+
+
+def test_run_once_batch_respects_requested_concurrency(monkeypatch):
+    mod = load_module()
+    calls: list[tuple[int, str]] = []
+
+    def fake_run_one(*, timeout: int, executor: str) -> bool:
+        calls.append((timeout, executor))
+        return len(calls) == 2
+
+    monkeypatch.setattr(mod, "run_one", fake_run_one)
+
+    result = mod._run_once_batch(timeout=9, executor="background-job-worker", concurrency=3)
+
+    assert result is True
+    assert calls == [(9, "background-job-worker")] * 3
+
+
+def test_main_reads_background_job_concurrency_from_env(monkeypatch):
+    mod = load_module()
+    monkeypatch.setenv("HERMES_BACKGROUND_JOB_CONCURRENCY", "3")
+    monkeypatch.setattr(mod, "_run_once_batch", lambda *, timeout, executor, concurrency: concurrency == 3)
+    monkeypatch.setattr(sys, "argv", ["background_job_worker.py", "--once"])
+
+    assert mod.main() == 0

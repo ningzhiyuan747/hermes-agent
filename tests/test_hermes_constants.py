@@ -7,7 +7,7 @@ from unittest.mock import patch
 import pytest
 
 import hermes_constants
-from hermes_constants import get_default_hermes_root, is_container
+from hermes_constants import get_cron_home, get_default_hermes_root, is_container
 
 
 class TestGetDefaultHermesRoot:
@@ -61,6 +61,25 @@ class TestGetDefaultHermesRoot:
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(profile))
         assert get_default_hermes_root() == docker_root
+
+
+class TestGetCronHome:
+    """Cron state should resolve to the shared Hermes root, not a profile dir."""
+
+    def test_profile_uses_root_cron_home(self, tmp_path, monkeypatch):
+        native = tmp_path / ".hermes"
+        profile = native / "profiles" / "openclaw"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        assert get_cron_home() == native
+
+    def test_non_profile_uses_current_root(self, tmp_path, monkeypatch):
+        docker_root = tmp_path / "opt" / "data"
+        docker_root.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(docker_root))
+        assert get_cron_home() == docker_root
 
 
 class TestIsContainer:

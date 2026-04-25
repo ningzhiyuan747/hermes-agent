@@ -65,6 +65,7 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
         lambda **kwargs: [
             {
                 "run_id": "run-1",
+                "session_id": "run-session-1",
                 "status": "queued",
                 "title": "Weixin follow-up",
                 "capability_name": "bid_research",
@@ -203,10 +204,14 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
     assert first["requested_executor_override"] == "codex"
     assert first["operator_queue_count"] == 1
     assert first["operator_queue_next"] == "Switch task to executor 'codex'."
+    assert first["related_ids"]["source_session_id"] == "sess-1"
+    assert first["related_ids"]["owner_user_id"] == "wx-user-9"
+    assert first["related_ids"]["source_thread_id"] == ""
 
     run_unit = next(unit for unit in snapshot["units"] if unit["unit_id"] == "run:run-1")
     assert run_unit["origin_platform"] == "weixin"
     assert run_unit["related_ids"]["background_job_id"] == "job-1"
+    assert run_unit["related_ids"]["session_id"] == "run-session-1"
     assert run_unit["task_scope_key"] == "weixin:chat:wx-1"
     assert run_unit["person_memory_key"] == "weixin:user:wx-user-9"
     assert run_unit["conversation_role"] == "chat_surface"
@@ -219,6 +224,7 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
 
     job_unit = next(unit for unit in snapshot["units"] if unit["unit_id"] == "job:job-1")
     assert job_unit["related_ids"]["capability_run_id"] == "run-1"
+    assert job_unit["related_ids"]["session_id"] == "sess-1"
     assert job_unit["owner"] == "sess-1"
     assert job_unit["task_scope_key"] == "dingtalk:chat:ops-group"
     assert job_unit["person_memory_key"] == "dingtalk:user:alice"

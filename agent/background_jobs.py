@@ -415,6 +415,38 @@ def list_jobs(status: str = "", limit: int = 10, active_only: bool = False) -> L
     return rows[: max(1, int(limit or 10))]
 
 
+def summarize_jobs() -> Dict[str, Any]:
+    rows = iter_jobs()
+    status_counts: Dict[str, int] = {}
+    runtime_counts: Dict[str, int] = {}
+    executor_counts: Dict[str, int] = {}
+    for row in rows:
+        status = str(row.get("status") or "").strip().lower() or "unknown"
+        runtime = str(row.get("runner_runtime") or "").strip().lower() or "idle"
+        executor = str(row.get("executor") or "").strip().lower() or "unassigned"
+        status_counts[status] = status_counts.get(status, 0) + 1
+        executor_counts[executor] = executor_counts.get(executor, 0) + 1
+        if status == "running":
+            runtime_counts[runtime] = runtime_counts.get(runtime, 0) + 1
+    concurrency = max(1, int(os.getenv("HERMES_BACKGROUND_JOB_CONCURRENCY", "1") or "1"))
+    return {
+        "total": len(rows),
+        "active": sum(status_counts.get(name, 0) for name in ACTIVE_STATUSES),
+        "queued": status_counts.get("queued", 0),
+        "running": status_counts.get("running", 0),
+        "paused": status_counts.get("paused", 0),
+        "blocked": status_counts.get("blocked", 0),
+        "completed": status_counts.get("completed", 0),
+        "failed": status_counts.get("failed", 0),
+        "cancelled": status_counts.get("cancelled", 0),
+        "status_counts": status_counts,
+        "runtime_counts": runtime_counts,
+        "executor_counts": executor_counts,
+        "configured_concurrency": concurrency,
+        "available_slots": max(0, concurrency - status_counts.get("running", 0)),
+    }
+
+
 def recent_events(job_id: str, limit: int = 8) -> List[Dict[str, Any]]:
     record = get_job(job_id)
     if not record:
@@ -439,15 +471,48 @@ def recent_events(job_id: str, limit: int = 8) -> List[Dict[str, Any]]:
 
 def render_jobs_status(status: str = "", limit: int = 10, active_only: bool = False) -> str:
     rows = list_jobs(status=status, limit=limit, active_only=active_only)
+    summary = summarize_jobs()
     header = "后台任务看板"
     if active_only:
         header += "（活跃）"
     elif status:
         header += f"（{status}）"
     if not rows:
-        return f"{header}\n\n没有找到后台任务。"
+        lines = [
+            header,
+            "",
+            (
+                f"总数: {summary['total']} | 活跃: {summary['active']} | 排队: {summary['queued']} | "
+                f"运行中: {summary['running']} | 失败: {summary['failed']} | 已完成: {summary['completed']}"
+            ),
+            f"后台并发: {summary['configured_concurrency']} | 空闲槽位: {summary['available_slots']}",
+            "",
+            "没有找到后台任务。",
+        ]
+        return "\n".join(lines)
 
-    lines = [header, ""]
+    lines = [
+        header,
+        "",
+        (
+            f"总数: {summary['total']} | 活跃: {summary['active']} | 排队: {summary['queued']} | "
+            f"运行中: {summary['running']} | 失败: {summary['failed']} | 已完成: {summary['completed']}"
+        ),
+        f"后台并发: {summary['configured_concurrency']} | 空闲槽位: {summary['available_slots']}",
+    ]
+    runtime_counts = summary.get("runtime_counts") or {}
+    if runtime_counts:
+        runtime_bits = []
+        for key in ("openclaw", "hermes", "idle"):
+            if runtime_counts.get(key):
+                label = "OpenClaw" if key == "openclaw" else ("Hermes" if key == "hermes" else "其他")
+                runtime_bits.append(f"{label}:{runtime_counts.get(key)}")
+        for key, value in runtime_counts.items():
+            if key not in {"openclaw", "hermes", "idle"}:
+                runtime_bits.append(f"{key}:{value}")
+        if runtime_bits:
+            lines.append("运行中分布: " + " | ".join(runtime_bits))
+    lines.append("")
     for row in rows:
         updated = int(row.get("updated_at_unix") or row.get("created_at_unix") or 0)
         stamp = time.strftime("%m-%d %H:%M", time.localtime(updated)) if updated else "unknown"
@@ -455,6 +520,15 @@ def render_jobs_status(status: str = "", limit: int = 10, active_only: bool = Fa
         focus = str(row.get("current_focus") or "").strip()
         next_step = str(row.get("next_step") or "").strip()
         blocker = str(row.get("blocker") or "").strip()
+        runtime = str(row.get("runner_runtime") or "").strip()
+        executor = str(row.get("executor") or "").strip()
+        if runtime or executor:
+            runtime_bits = []
+            if runtime:
+                runtime_bits.append(f"运行时: {runtime}")
+            if executor:
+                runtime_bits.append(f"执行器: {executor}")
+            lines.append("  " + " | ".join(runtime_bits))
         if focus:
             lines.append(f"  当前: {_short_title(focus, 100)}")
         if next_step:

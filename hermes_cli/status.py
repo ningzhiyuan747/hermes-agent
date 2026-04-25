@@ -413,7 +413,9 @@ def show_status(args):
     print()
     print(color("◆ Scheduled Jobs", Colors.CYAN, Colors.BOLD))
     
-    jobs_file = get_hermes_home() / "cron" / "jobs.json"
+    from hermes_constants import get_cron_home
+
+    jobs_file = get_cron_home() / "cron" / "jobs.json"
     if jobs_file.exists():
         import json
         try:

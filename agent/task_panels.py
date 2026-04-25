@@ -87,7 +87,7 @@ def format_task_panel_snapshot(snapshot: Dict[str, Any], *, header: str = "当�
             f"当前子代理: {str(current_delegation.get('worker_role') or current_delegation.get('role_title') or '-').strip()} / {str(current_delegation.get('status') or '-').strip()}"
         )
     if approvals:
-        lines.append(f"待审批: {len(approvals)}")
+        lines.append(f"待业务审批: {len(approvals)}")
     current_focus = str(control_summary.get("current_focus") or "").strip()
     next_step = str(control_summary.get("next_step") or "").strip()
     blocker = str(control_summary.get("blocker") or "").strip()
@@ -173,8 +173,8 @@ def format_approval_list_text(
     scope_all: bool = False,
 ) -> str:
     if not approvals:
-        return "当前没有待处理审批。"
-    lines = ["审批列表（全部）：" if scope_all else "当前任务审批列表：" if task_id else "当前会话审批列表："]
+        return "当前没有待处理业务审批。"
+    lines = ["业务审批列表（全部）：" if scope_all else "当前任务业务审批列表：" if task_id else "当前会话业务审批列表："]
     if task_id:
         lines.append(f"任务：{task_title or task_id}")
     for item in approvals[:8]:
@@ -243,7 +243,7 @@ def format_capability_run_snapshot_lines(
         lines.append(f"任务{colon} {task_title or task_id}")
     approval_id = str(run.get("approval_id") or "").strip()
     if approval_id:
-        lines.append(f"审批ID{colon} {approval_id}")
+        lines.append(f"业务审批ID{colon} {approval_id}")
     focus = str(run.get("current_focus") or "").strip()
     next_step = str(run.get("next_step") or "").strip()
     blocker = str(run.get("blocker") or "").strip()
@@ -325,7 +325,7 @@ def format_background_job_snapshot_lines(
     if task_id:
         lines.append(f"任务{colon} {task_title or task_id}")
     if approval_id:
-        lines.append(f"Approval{colon} {approval_id}")
+        lines.append(f"Business approval{colon} {approval_id}")
     if capability_focus:
         lines.append(f"Run focus{colon} {capability_focus[:120]}")
     if capability_next_step:

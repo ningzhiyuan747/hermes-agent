@@ -279,7 +279,7 @@ def get_task_panel_snapshot(task_id: str, *, active_only: bool = False) -> Optio
     current_run = active_runs[0] if active_runs else (runs[0] if runs and not active_only else None)
     run_ids = [str(row.get("run_id") or "").strip() for row in runs if str(row.get("run_id") or "").strip()]
 
-    approval_rows = list_approvals(status="pending" if active_only else "", limit=100)
+    approval_rows = list_approvals(status="pending", limit=100)
     approvals: list[Dict[str, Any]] = []
     for item in approval_rows:
         payload = item.get("payload") if isinstance(item.get("payload"), dict) else {}

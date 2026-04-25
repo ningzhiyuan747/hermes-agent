@@ -56,6 +56,20 @@ def get_default_hermes_root() -> Path:
     return env_path
 
 
+def get_cron_home() -> Path:
+    """Return the shared Hermes home used for scheduler state.
+
+    Cron jobs are part of Hermes' control plane rather than per-profile scratch
+    state. When running inside a named profile (for example
+    ``~/.hermes/profiles/openclaw``), scheduled jobs should still be read from
+    the root Hermes data directory (``~/.hermes``) so CLI tools, the gateway,
+    and worker profiles all operate on the same job registry.
+
+    In non-profile deployments this is identical to ``get_hermes_home()``.
+    """
+    return get_default_hermes_root()
+
+
 def get_optional_skills_dir(default: Path | None = None) -> Path:
     """Return the optional-skills directory, honoring package-manager wrappers.
 

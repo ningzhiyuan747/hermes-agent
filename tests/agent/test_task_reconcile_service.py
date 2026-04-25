@@ -497,3 +497,210 @@ def test_reconcile_task_records_refreshes_failed_terminal_task_control_plane(tmp
     assert refreshed is not None
     assert refreshed["status"] == "failed"
     assert refreshed["metadata"]["control_plane"]["failure_kind"] == "credential_failed"
+
+
+def test_reconcile_task_records_terminalizes_queued_run_when_background_job_is_completed(tmp_path, monkeypatch):
+    db_file = tmp_path / "hermes-business.sqlite3"
+    jobs_dir = tmp_path / "background_jobs"
+    monkeypatch.setattr(business_db, "db_path", lambda: db_file)
+    monkeypatch.setattr(background_jobs, "jobs_root", lambda: jobs_dir)
+
+    task = business_db.create_task(
+        title="Queued run shell",
+        goal="Follow background completion",
+        owner_user_id="ou_job",
+        source_platform="dingtalk",
+        source_chat_id="cid_demo",
+        source_session_id="agent:main:dingtalk:group:cid_demo:ou_job",
+        metadata={},
+    )
+    task_id = str(task.get("task_id") or "").strip()
+
+    with business_db.connect() as conn:
+        cap = conn.execute("SELECT capability_id FROM capabilities WHERE name='bid_research'").fetchone()
+        conn.execute(
+            """
+            INSERT INTO capability_runs(
+                run_id, trace_id, capability_id, task_id, title, goal, status, priority,
+                origin_json, actor_user_id, session_id, background_job_id, approval_id,
+                current_focus, next_step, blocker, result, input_json, output_json,
+                created_at_unix, updated_at_unix, started_at_unix, finished_at_unix
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "run-stale-queued-1",
+                "trace-stale-queued-1",
+                cap["capability_id"],
+                task_id,
+                "Queued stale run",
+                "Need the background result",
+                "queued",
+                "normal",
+                '{"platform":"dingtalk","chat_id":"cid_demo","chat_type":"group","thread_id":""}',
+                "ou_job",
+                "agent:main:dingtalk:group:cid_demo:ou_job",
+                "job-stale-completed-1",
+                "",
+                "Waiting for job",
+                "Wait",
+                "",
+                "",
+                "{}",
+                "{}",
+                100,
+                100,
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+
+    job_dir = jobs_dir / "job-stale-completed-1"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "job_id": "job-stale-completed-1",
+                "trace_id": "trace-job-stale-completed-1",
+                "task_id": task_id,
+                "title": "Completed stale job",
+                "prompt": "Need the background result",
+                "status": "completed",
+                "priority": "normal",
+                "tags": ["capability_run:run-stale-queued-1"],
+                "origin": {"platform": "dingtalk", "chat_id": "cid_demo", "thread_id": ""},
+                "session_id": "agent:main:dingtalk:group:cid_demo:ou_job",
+                "user_id": "ou_job",
+                "created_at_unix": 100,
+                "updated_at_unix": 120,
+                "started_at_unix": 110,
+                "finished_at_unix": 120,
+                "current_focus": "Background job completed.",
+                "next_step": "Review the result.",
+                "blocker": "",
+                "result": "done",
+                "artifact_paths": [],
+                "job_dir": str(job_dir),
+                "events_path": str(job_dir / "events.jsonl"),
+                "executor": "openclaw-worker",
+                "runner_pid": None,
+                "runner_runtime": "",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = task_reconcile_service.reconcile_task_records(limit=20)
+
+    assert summary["runs_terminalized"] >= 1
+    run = business_db.get_capability_run("run-stale-queued-1")
+    assert run is not None
+    assert run["status"] == "completed"
+    assert run["result"] == "done"
+
+
+def test_reconcile_task_records_fails_stale_running_job_with_dead_pid(tmp_path, monkeypatch):
+    db_file = tmp_path / "hermes-business.sqlite3"
+    jobs_dir = tmp_path / "background_jobs"
+    monkeypatch.setattr(business_db, "db_path", lambda: db_file)
+    monkeypatch.setattr(background_jobs, "jobs_root", lambda: jobs_dir)
+    monkeypatch.setenv("HERMES_RECONCILE_STALE_RUNNING_JOB_SECONDS", "300")
+    monkeypatch.setattr(task_reconcile_service, "_pid_exists", lambda pid: False)
+
+    task = business_db.create_task(
+        title="Stale running shell",
+        goal="Detect dead worker",
+        owner_user_id="ou_job",
+        source_platform="dingtalk",
+        source_chat_id="cid_demo",
+        source_session_id="agent:main:dingtalk:group:cid_demo:ou_job",
+        metadata={},
+    )
+    task_id = str(task.get("task_id") or "").strip()
+
+    with business_db.connect() as conn:
+        cap = conn.execute("SELECT capability_id FROM capabilities WHERE name='bid_research'").fetchone()
+        conn.execute(
+            """
+            INSERT INTO capability_runs(
+                run_id, trace_id, capability_id, task_id, title, goal, status, priority,
+                origin_json, actor_user_id, session_id, background_job_id, approval_id,
+                current_focus, next_step, blocker, result, input_json, output_json,
+                created_at_unix, updated_at_unix, started_at_unix, finished_at_unix
+            )
+            VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                "run-stale-running-1",
+                "trace-stale-running-1",
+                cap["capability_id"],
+                task_id,
+                "Running stale run",
+                "Detect dead worker",
+                "queued",
+                "normal",
+                '{"platform":"dingtalk","chat_id":"cid_demo","chat_type":"group","thread_id":""}',
+                "ou_job",
+                "agent:main:dingtalk:group:cid_demo:ou_job",
+                "job-stale-running-1",
+                "",
+                "Waiting for running job",
+                "Wait",
+                "",
+                "",
+                "{}",
+                "{}",
+                100,
+                100,
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+
+    job_dir = jobs_dir / "job-stale-running-1"
+    job_dir.mkdir(parents=True, exist_ok=True)
+    (job_dir / "job.json").write_text(
+        json.dumps(
+            {
+                "job_id": "job-stale-running-1",
+                "trace_id": "trace-job-stale-running-1",
+                "task_id": task_id,
+                "title": "Dead worker job",
+                "prompt": "Detect dead worker",
+                "status": "running",
+                "priority": "normal",
+                "tags": ["capability_run:run-stale-running-1"],
+                "origin": {"platform": "dingtalk", "chat_id": "cid_demo", "thread_id": ""},
+                "session_id": "agent:main:dingtalk:group:cid_demo:ou_job",
+                "user_id": "ou_job",
+                "created_at_unix": 100,
+                "updated_at_unix": 100,
+                "started_at_unix": 100,
+                "finished_at_unix": None,
+                "current_focus": "Running.",
+                "next_step": "Wait.",
+                "blocker": "",
+                "result": "",
+                "artifact_paths": [],
+                "job_dir": str(job_dir),
+                "events_path": str(job_dir / "events.jsonl"),
+                "executor": "openclaw-worker",
+                "runner_pid": 303,
+                "runner_runtime": "openclaw",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    summary = task_reconcile_service.reconcile_task_records(limit=20)
+
+    assert summary["jobs_failed"] >= 1
+    job = background_jobs.get_job("job-stale-running-1")
+    run = business_db.get_capability_run("run-stale-running-1")
+    assert job is not None
+    assert run is not None
+    assert job["status"] == "failed"
+    assert run["status"] == "failed"
+    assert "no longer alive" in str(job.get("blocker") or "").lower()

@@ -22,6 +22,10 @@ _ABSOLUTE_ATTACHMENT_RE = re.compile(
     re.IGNORECASE,
 )
 _ATTACHMENT_CONTEXT_RE = re.compile(r"(本轮实际生成的文件|文件在这里|写入回执|Successfully wrote|已保存文件|已导出文件|本次生成文件)", re.IGNORECASE)
+_FORMAL_DOCUMENT_RE = re.compile(
+    r"报价单|报价表|招标文件|投标文件|标书|承诺书|授权书|授权证明|声明函|合同|方案|申购|论证|参数表|汇总表|需求表|报告|docx|xlsx|pdf",
+    re.IGNORECASE,
+)
 
 
 def _max_delivery_chars() -> int:
@@ -64,11 +68,50 @@ def _is_openclaw_job(job: Dict[str, Any]) -> bool:
     return executor in {"openclaw", "openclaw-worker"} or runner_runtime == "openclaw"
 
 
+def _collect_document_artifact_paths(text: str) -> list[Path]:
+    paths: list[Path] = []
+    seen: set[str] = set()
+    for candidate in _extract_declared_attachment_paths(text) + _extract_evidence_attachment_paths(text):
+        key = str(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        paths.append(candidate)
+    return paths
+
+
+def _looks_like_formal_document_job(job: Dict[str, Any]) -> bool:
+    title = str(job.get("title") or "").strip()
+    prompt = str(job.get("prompt") or "").strip()
+    result = str(job.get("result") or "").strip()
+    if _collect_document_artifact_paths(result):
+        return True
+    corpus = "\n".join([title, prompt, result])
+    return bool(_FORMAL_DOCUMENT_RE.search(corpus) or "模板来源：" in result or "本次生成文件：" in result)
+
+
+def _format_formal_document_delivery_message(job: Dict[str, Any]) -> str:
+    title = str(job.get("title") or job.get("job_id") or "文档").strip()
+    result = str(job.get("result") or "").strip()
+    lines = [f"已生成：{title}"]
+    artifacts = _collect_document_artifact_paths(result)
+    if artifacts:
+        lines.extend(["", "本次生成文件："])
+        for path in artifacts[:3]:
+            lines.append(f"- {path}")
+    else:
+        lines.append("")
+        lines.append("成品文件已生成。")
+    return "\n".join(lines).strip()
+
+
 def format_delivery_message(job: Dict[str, Any], *, failed: bool = False) -> str:
     job_id = str(job.get("job_id") or "")
     title = str(job.get("title") or job_id)
     result = str(job.get("result") or "").strip()
     blocker = str(job.get("blocker") or "").strip()
+    if not failed and _looks_like_formal_document_job(job):
+        return _format_formal_document_delivery_message(job)
     body = blocker if failed and blocker else result
     body, truncated = trim_for_delivery(body or "没有可展示的结果。")
     status_text = "失败" if failed else "完成"

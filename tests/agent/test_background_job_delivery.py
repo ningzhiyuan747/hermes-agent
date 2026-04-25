@@ -99,3 +99,68 @@ def test_extract_sendable_dingtalk_attachments_ignores_reference_file_paths(tmp_
     attachments = background_job_delivery._extract_sendable_dingtalk_attachments(text)
 
     assert attachments == []
+
+
+def test_format_delivery_message_for_formal_document_is_concise(tmp_path):
+    docx = tmp_path / "信用承诺书.docx"
+    pdf = tmp_path / "信用承诺书.pdf"
+    docx.write_text("docx", encoding="utf-8")
+    pdf.write_text("pdf", encoding="utf-8")
+
+    message = format_delivery_message(
+        {
+            "job_id": "job-2",
+            "title": "信用承诺书初稿",
+            "prompt": "按模板生成一份信用承诺书，并输出 docx/pdf",
+            "result": (
+                "模板来源：F:\\模板库\\信用承诺书模板.doc\n"
+                "正文第一段\n"
+                "执行结果：\n"
+                f"- 已导出文件：{docx}\n"
+                f"- 已导出文件：{pdf}\n"
+                "证据：\n"
+                "- 文档校验通过\n"
+            ),
+        }
+    )
+
+    assert message.startswith("已生成：信用承诺书初稿")
+    assert "本次生成文件：" in message
+    assert str(docx) in message
+    assert str(pdf) in message
+    assert "执行结果" not in message
+    assert "证据" not in message
+
+
+def test_deliver_job_result_marks_delivery_failed_when_platform_send_returns_error(monkeypatch):
+    job = {
+        "job_id": "job-3",
+        "origin": {"platform": "weixin", "chat_id": "wxid_demo"},
+        "result": "done",
+    }
+    updates = []
+    events = []
+
+    monkeypatch.setattr(background_job_delivery, "get_job", lambda _job_id: dict(job))
+    monkeypatch.setattr(
+        background_job_delivery,
+        "update_job",
+        lambda job_id, **fields: updates.append((job_id, fields)) or {**job, **fields},
+    )
+    monkeypatch.setattr(
+        background_job_delivery,
+        "append_job_event",
+        lambda job_id, **fields: events.append((job_id, fields)),
+    )
+    monkeypatch.setattr(
+        background_job_delivery,
+        "send_text_to_target",
+        lambda target, text: {"error": "Weixin send failed: invalid context"},
+    )
+
+    updated = background_job_delivery.deliver_job_result(job)
+
+    assert updated["delivery_status"] == "failed"
+    assert "invalid context" in updated["delivery_error"]
+    assert updates[-1][1]["delivery_status"] == "failed"
+    assert events[-1][1]["kind"] == "delivery_failed"

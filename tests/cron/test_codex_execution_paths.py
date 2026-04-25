@@ -163,7 +163,7 @@ def test_gateway_run_agent_codex_path_handles_internal_401_refresh(monkeypatch):
     monkeypatch.setattr(
         gateway_run.GatewayRunner,
         "_resolve_turn_agent_config",
-        lambda self, msg, model, runtime: {
+        lambda self, msg, model, runtime, source=None: {
             "model": model or "gpt-5.3-codex",
             "runtime": runtime,
         },

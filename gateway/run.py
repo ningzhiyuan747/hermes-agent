@@ -969,7 +969,84 @@ class GatewayRunner:
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
+    @staticmethod
+    def _parse_env_identifier_set(*env_names: str) -> set[str]:
+        identifiers: set[str] = set()
+        for env_name in env_names:
+            raw = str(os.getenv(env_name, "") or "").strip()
+            if not raw:
+                continue
+            identifiers.update(
+                item.strip()
+                for item in raw.split(",")
+                if item.strip()
+            )
+        return identifiers
+
+    def _is_high_value_route_allowed(self, source: Optional[SessionSource]) -> bool:
+        if source is None:
+            return True
+
+        platform = getattr(getattr(source, "platform", None), "value", "") or ""
+        platform = str(platform).strip().lower()
+        if platform == Platform.LOCAL.value:
+            return True
+
+        candidates = {
+            str(getattr(source, "user_id", "") or "").strip(),
+            str(getattr(source, "user_id_alt", "") or "").strip(),
+            str(getattr(source, "chat_id", "") or "").strip(),
+            str(getattr(source, "chat_id_alt", "") or "").strip(),
+        }
+        candidates.discard("")
+
+        explicit_allowed = self._parse_env_identifier_set("HERMES_HIGH_VALUE_ROUTE_ALLOWED_USERS")
+        if explicit_allowed and candidates & explicit_allowed:
+            return True
+
+        if platform == Platform.FEISHU.value:
+            owner_ids = self._parse_env_identifier_set("FEISHU_OWNER_IDS")
+            return bool(owner_ids and candidates & owner_ids)
+
+        if platform == Platform.DINGTALK.value:
+            owner_ids = self._parse_env_identifier_set("DINGTALK_OWNER_IDS")
+            return bool(owner_ids and candidates & owner_ids)
+
+        if platform == Platform.WEIXIN.value:
+            owner_ids = self._parse_env_identifier_set("WEIXIN_OWNER_IDS")
+            if owner_ids and candidates & owner_ids:
+                return True
+            home_channel = str(os.getenv("WEIXIN_HOME_CHANNEL", "") or "").strip()
+            return bool(home_channel and str(getattr(source, "chat_id", "") or "").strip() == home_channel)
+
+        return False
+
+    def _smart_routing_config_for_source(self, source: Optional[SessionSource]) -> dict:
+        cfg = getattr(self, "_smart_model_routing", {}) or {}
+        if not isinstance(cfg, dict) or not cfg:
+            return {}
+
+        high_value_model = cfg.get("high_value_model") or {}
+        if not isinstance(high_value_model, dict):
+            return cfg
+
+        if not is_truthy_value(high_value_model.get("owner_only"), default=False):
+            return cfg
+
+        if self._is_high_value_route_allowed(source):
+            return cfg
+
+        filtered = dict(cfg)
+        filtered["high_value_model"] = {}
+        return filtered
+
+    def _resolve_turn_agent_config(
+        self,
+        user_message: str,
+        model: str,
+        runtime_kwargs: dict,
+        source: Optional[SessionSource] = None,
+    ) -> dict:
         from agent.smart_model_routing import resolve_turn_route
         from hermes_cli.models import resolve_fast_mode_overrides
 
@@ -983,7 +1060,8 @@ class GatewayRunner:
             "args": list(runtime_kwargs.get("args") or []),
             "credential_pool": runtime_kwargs.get("credential_pool"),
         }
-        route = resolve_turn_route(user_message, getattr(self, "_smart_model_routing", {}), primary)
+        routing_config = self._smart_routing_config_for_source(source)
+        route = resolve_turn_route(user_message, routing_config, primary)
 
         service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
@@ -1084,11 +1162,21 @@ class GatewayRunner:
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
+            
+            # Capture browser backend status for diagnostics
+            browser_backend = None
+            try:
+                from tools.browser_tool import get_browser_backend_status
+                browser_backend = get_browser_backend_status()
+            except Exception:
+                pass
+            
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
                 active_agents=self._running_agent_count(),
+                browser_backend=browser_backend,
             )
         except Exception:
             pass
@@ -1767,7 +1855,15 @@ class GatewayRunner:
             pass
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
+            write_runtime_status(
+                gateway_state="starting",
+                exit_reason=None,
+                configured_platforms=[
+                    platform.value
+                    for platform, platform_config in self.config.platforms.items()
+                    if platform_config.enabled
+                ],
+            )
         except Exception:
             pass
         
@@ -2694,6 +2790,208 @@ class GatewayRunner:
         if config and hasattr(config, "get_unauthorized_dm_behavior"):
             return config.get_unauthorized_dm_behavior(platform)
         return "pair"
+
+    def _session_hygiene_limits_for_source(self, source: SessionSource) -> tuple[float, int]:
+        """Return proactive compression thresholds for a source.
+
+        Weixin DMs need a lower ceiling because they frequently evolve into
+        long-running private conversations and users expect a direct answer
+        instead of manual /reset or /compact intervention.
+        """
+        threshold_pct = 0.85
+        hard_msg_limit = 400
+        if source.platform == Platform.WEIXIN and source.chat_type == "dm":
+            try:
+                threshold_pct = float(
+                    os.getenv("HERMES_WEIXIN_DM_HYGIENE_THRESHOLD", "0.60")
+                )
+            except ValueError:
+                threshold_pct = 0.60
+            try:
+                hard_msg_limit = int(
+                    os.getenv("HERMES_WEIXIN_DM_HARD_MSG_LIMIT", "120")
+                )
+            except ValueError:
+                hard_msg_limit = 120
+        return threshold_pct, hard_msg_limit
+
+    def _should_retry_after_auto_compact(
+        self,
+        *,
+        source: SessionSource,
+        history: list,
+        session_entry,
+        agent_result: dict,
+    ) -> bool:
+        """Decide whether a failed turn should be retried once after compaction."""
+        if source.platform != Platform.WEIXIN or source.chat_type != "dm":
+            return False
+        if len(history) < 4:
+            return False
+
+        final_response = (agent_result.get("final_response") or "").strip()
+        failed = bool(agent_result.get("failed")) or not final_response
+        if not failed:
+            return False
+
+        error_text = str(agent_result.get("error") or "").lower()
+        retryable_error = any(
+            marker in error_text
+            for marker in (
+                "overloaded",
+                "processing your request",
+                "rate limit",
+                "payload too large",
+                "context",
+                "too large",
+                "too long",
+            )
+        )
+
+        try:
+            retry_msg_limit = int(
+                os.getenv("HERMES_WEIXIN_DM_RETRY_COMPACT_MESSAGES", "60")
+            )
+        except ValueError:
+            retry_msg_limit = 60
+        try:
+            retry_token_limit = int(
+                os.getenv("HERMES_WEIXIN_DM_RETRY_COMPACT_TOKENS", "100000")
+            )
+        except ValueError:
+            retry_token_limit = 100000
+
+        from agent.model_metadata import estimate_messages_tokens_rough
+
+        approx_tokens = session_entry.last_prompt_tokens or estimate_messages_tokens_rough(history)
+        return retryable_error or len(history) >= retry_msg_limit or approx_tokens >= retry_token_limit
+
+    def _humanize_agent_failure(self, error_text: str) -> str:
+        """Convert raw provider/runtime failures into short user-facing text."""
+        lowered = (error_text or "").strip().lower()
+        if not lowered:
+            return "⚠️ 这次请求没有拿到可用结果，请稍后重试。"
+        if "processing your request" in lowered or "failed after 3 retries" in lowered:
+            return "⚠️ 主模型这次连续失败，消息已收到。请稍后重试；如果这条会话已经很长，直接发 /reset 会更稳。"
+        if "overloaded" in lowered:
+            return "⚠️ 模型服务当前过载，消息已收到。请稍后重试。"
+        if "rate limit" in lowered:
+            return "⚠️ 模型服务当前限流，消息已收到。请稍后重试。"
+        if "context" in lowered or "payload too large" in lowered or "too large" in lowered or "too long" in lowered:
+            return "⚠️ 这条会话上下文太大，建议先发 /compact 或 /reset 再继续。"
+        if "provider authentication failed" in lowered or "401" in lowered:
+            return "⚠️ 模型认证当前有问题，我这边需要先修复配置。"
+        return "⚠️ 这次请求失败了，消息已收到。请稍后重试。"
+
+    async def _auto_compact_session_history(
+        self,
+        *,
+        source: SessionSource,
+        session_key: str,
+        session_entry,
+        history: list,
+        approx_tokens: Optional[int] = None,
+    ) -> tuple[list, bool]:
+        """Compact a session transcript in-place and return the rewritten history."""
+        if len(history) < 4:
+            return history, False
+
+        from agent.model_metadata import estimate_messages_tokens_rough
+        from run_agent import AIAgent
+
+        _hyg_model = "anthropic/claude-sonnet-4.6"
+        _hyg_compression_enabled = True
+        _hyg_config_context_length = None
+        _hyg_provider = None
+        _hyg_base_url = None
+        _hyg_api_key = None
+        _hyg_data = {}
+
+        try:
+            _hyg_cfg_path = _hermes_home / "config.yaml"
+            if _hyg_cfg_path.exists():
+                import yaml as _hyg_yaml
+                with open(_hyg_cfg_path, encoding="utf-8") as _hyg_f:
+                    _hyg_data = _hyg_yaml.safe_load(_hyg_f) or {}
+
+                _model_cfg = _hyg_data.get("model", {})
+                if isinstance(_model_cfg, str):
+                    _hyg_model = _model_cfg
+                elif isinstance(_model_cfg, dict):
+                    _hyg_model = _model_cfg.get("default") or _model_cfg.get("model") or _hyg_model
+                    _raw_ctx = _model_cfg.get("context_length")
+                    if _raw_ctx is not None:
+                        try:
+                            _hyg_config_context_length = int(_raw_ctx)
+                        except (TypeError, ValueError):
+                            pass
+                    _hyg_provider = _model_cfg.get("provider") or None
+                    _hyg_base_url = _model_cfg.get("base_url") or None
+
+                _comp_cfg = _hyg_data.get("compression", {})
+                if isinstance(_comp_cfg, dict):
+                    _hyg_compression_enabled = str(
+                        _comp_cfg.get("enabled", True)
+                    ).lower() in ("true", "1", "yes")
+
+            _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
+                source=source,
+                session_key=session_key,
+                user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
+            )
+            _hyg_provider = _hyg_runtime.get("provider") or _hyg_provider
+            _hyg_base_url = _hyg_runtime.get("base_url") or _hyg_base_url
+            _hyg_api_key = _hyg_runtime.get("api_key") or _hyg_api_key
+        except Exception:
+            _hyg_runtime = {}
+
+        if not _hyg_compression_enabled or not _hyg_runtime.get("api_key"):
+            return history, False
+
+        _approx_tokens = approx_tokens or estimate_messages_tokens_rough(history)
+        _hyg_msgs = [
+            {"role": m.get("role"), "content": m.get("content")}
+            for m in history
+            if m.get("role") in ("user", "assistant") and m.get("content")
+        ]
+        if len(_hyg_msgs) < 4:
+            return history, False
+
+        _hyg_agent = AIAgent(
+            **_hyg_runtime,
+            model=_hyg_model,
+            max_iterations=4,
+            quiet_mode=True,
+            skip_memory=True,
+            enabled_toolsets=["memory"],
+            session_id=session_entry.session_id,
+        )
+        try:
+            _hyg_agent._print_fn = lambda *a, **kw: None
+            loop = asyncio.get_running_loop()
+            _compressed, _ = await loop.run_in_executor(
+                None,
+                lambda: _hyg_agent._compress_context(
+                    _hyg_msgs, "",
+                    approx_tokens=_approx_tokens,
+                ),
+            )
+
+            _hyg_new_sid = _hyg_agent.session_id
+            if _hyg_new_sid != session_entry.session_id:
+                session_entry.session_id = _hyg_new_sid
+                self.session_store._save()
+
+            self.session_store.rewrite_transcript(
+                session_entry.session_id, _compressed
+            )
+            session_entry.last_prompt_tokens = 0
+            return _compressed, True
+        except Exception as e:
+            logger.warning("Session auto-compact failed: %s", e)
+            return history, False
+        finally:
+            self._cleanup_agent_resources(_hyg_agent)
     
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -3682,7 +3980,7 @@ class GatewayRunner:
             # real token counts.  Having hygiene at 0.50 caused premature
             # compression on every turn in long gateway sessions.
             _hyg_model = "anthropic/claude-sonnet-4.6"
-            _hyg_threshold_pct = 0.85
+            _hyg_threshold_pct, _HARD_MSG_LIMIT = self._session_hygiene_limits_for_source(source)
             _hyg_compression_enabled = True
             _hyg_config_context_length = None
             _hyg_provider = None
@@ -3797,14 +4095,6 @@ class GatewayRunner:
                     # 85% * 1.4 = 119% of context — which exceeds the model's limit
                     # and prevented hygiene from ever firing for ~200K models (GLM-5).
 
-                # Hard safety valve: force compression if message count is
-                # extreme, regardless of token estimates.  This breaks the
-                # death spiral where API disconnects prevent token data
-                # collection, which prevents compression, which causes more
-                # disconnects.  400 messages is well above normal sessions
-                # but catches runaway growth before it becomes unrecoverable.
-                # (#2153)
-                _HARD_MSG_LIMIT = 400
                 _needs_compress = (
                     _approx_tokens >= _compress_token_threshold
                     or _msg_count >= _HARD_MSG_LIMIT
@@ -3822,84 +4112,29 @@ class GatewayRunner:
 
                     _hyg_meta = {"thread_id": source.thread_id} if source.thread_id else None
 
-                    try:
-                        from run_agent import AIAgent
-
-                        _hyg_model, _hyg_runtime = self._resolve_session_agent_runtime(
-                            source=source,
-                            session_key=session_key,
-                            user_config=_hyg_data if isinstance(_hyg_data, dict) else None,
+                    history, _did_compact = await self._auto_compact_session_history(
+                        source=source,
+                        session_key=session_key,
+                        session_entry=session_entry,
+                        history=history,
+                        approx_tokens=_approx_tokens,
+                    )
+                    if _did_compact:
+                        _new_count = len(history)
+                        _new_tokens = estimate_messages_tokens_rough(history)
+                        logger.info(
+                            "Session hygiene: compressed %s → %s msgs, "
+                            "~%s → ~%s tokens",
+                            _msg_count, _new_count,
+                            f"{_approx_tokens:,}", f"{_new_tokens:,}",
                         )
-                        if _hyg_runtime.get("api_key"):
-                            _hyg_msgs = [
-                                {"role": m.get("role"), "content": m.get("content")}
-                                for m in history
-                                if m.get("role") in ("user", "assistant")
-                                and m.get("content")
-                            ]
 
-                            if len(_hyg_msgs) >= 4:
-                                _hyg_agent = AIAgent(
-                                    **_hyg_runtime,
-                                    model=_hyg_model,
-                                    max_iterations=4,
-                                    quiet_mode=True,
-                                    skip_memory=True,
-                                    enabled_toolsets=["memory"],
-                                    session_id=session_entry.session_id,
-                                )
-                                try:
-                                    _hyg_agent._print_fn = lambda *a, **kw: None
-
-                                    loop = asyncio.get_running_loop()
-                                    _compressed, _ = await loop.run_in_executor(
-                                        None,
-                                        lambda: _hyg_agent._compress_context(
-                                            _hyg_msgs, "",
-                                            approx_tokens=_approx_tokens,
-                                        ),
-                                    )
-
-                                    # _compress_context ends the old session and creates
-                                    # a new session_id.  Write compressed messages into
-                                    # the NEW session so the old transcript stays intact
-                                    # and searchable via session_search.
-                                    _hyg_new_sid = _hyg_agent.session_id
-                                    if _hyg_new_sid != session_entry.session_id:
-                                        session_entry.session_id = _hyg_new_sid
-                                        self.session_store._save()
-
-                                    self.session_store.rewrite_transcript(
-                                        session_entry.session_id, _compressed
-                                    )
-                                    # Reset stored token count — transcript was rewritten
-                                    session_entry.last_prompt_tokens = 0
-                                    history = _compressed
-                                    _new_count = len(_compressed)
-                                    _new_tokens = estimate_messages_tokens_rough(
-                                        _compressed
-                                    )
-
-                                    logger.info(
-                                        "Session hygiene: compressed %s → %s msgs, "
-                                        "~%s → ~%s tokens",
-                                        _msg_count, _new_count,
-                                        f"{_approx_tokens:,}", f"{_new_tokens:,}",
-                                    )
-
-                                    if _new_tokens >= _warn_token_threshold:
-                                        logger.warning(
-                                            "Session hygiene: still ~%s tokens after "
-                                            "compression",
-                                            f"{_new_tokens:,}",
-                                        )
-                                finally:
-                                    self._cleanup_agent_resources(_hyg_agent)
-
-                    except Exception as e:
-                        logger.warning(
-                            "Session hygiene auto-compress failed: %s", e
-                        )
+                        if _new_tokens >= _warn_token_threshold:
+                            logger.warning(
+                                "Session hygiene: still ~%s tokens after "
+                                "compression",
+                                f"{_new_tokens:,}",
+                            )
 
         # First-message onboarding -- only on the very first interaction ever
         if not history and not self.session_store.has_any_sessions():
@@ -3980,6 +4215,41 @@ class GatewayRunner:
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
             )
+
+            if self._should_retry_after_auto_compact(
+                source=source,
+                history=history,
+                session_entry=session_entry,
+                agent_result=agent_result,
+            ):
+                from agent.model_metadata import estimate_messages_tokens_rough
+
+                _pre_retry_tokens = session_entry.last_prompt_tokens or estimate_messages_tokens_rough(history)
+                _retry_history, _did_retry_compact = await self._auto_compact_session_history(
+                    source=source,
+                    session_key=session_key,
+                    session_entry=session_entry,
+                    history=history,
+                    approx_tokens=_pre_retry_tokens,
+                )
+                if _did_retry_compact:
+                    logger.info(
+                        "Auto-retrying %s after compaction (%s msgs, ~%s tokens before compact).",
+                        session_key,
+                        len(history),
+                        f"{_pre_retry_tokens:,}",
+                    )
+                    history = _retry_history
+                    agent_result = await self._run_agent(
+                        message=message_text,
+                        context_prompt=context_prompt,
+                        history=history,
+                        source=source,
+                        session_id=session_entry.session_id,
+                        session_key=session_key,
+                        event_message_id=event.message_id,
+                        channel_prompt=event.channel_prompt,
+                    )
 
             # Stop persistent typing indicator now that the agent is done
             try:
@@ -6008,19 +6278,52 @@ class GatewayRunner:
 
         source = event.source
         task_id = f"bg_{datetime.now().strftime('%H%M%S')}_{os.urandom(3).hex()}"
+        job_id = ""
+        try:
+            from agent.background_jobs import create_job
+
+            job = create_job(
+                title=f"Gateway background: {prompt[:80]}",
+                prompt=prompt,
+                origin={
+                    "platform": source.platform.value if source.platform else "",
+                    "chat_id": source.chat_id,
+                    "thread_id": source.thread_id or "",
+                    "user_id": source.user_id,
+                    "user_name": source.user_name,
+                },
+                session_id=task_id,
+                user_id=source.user_id,
+                executor="gateway-background",
+                tags=[
+                    "origin:gateway",
+                    f"platform:{source.platform.value}" if source.platform else "",
+                    f"chat:{source.chat_id}" if source.chat_id else "",
+                ],
+            )
+            job_id = str((job or {}).get("job_id") or "").strip()
+        except Exception:
+            logger.debug("Failed to materialize background job record for %s", task_id, exc_info=True)
 
         # Fire-and-forget the background task
         _task = asyncio.create_task(
-            self._run_background_task(prompt, source, task_id)
+            self._run_background_task(prompt, source, task_id, job_id=job_id)
         )
         self._background_tasks.add(_task)
         _task.add_done_callback(self._background_tasks.discard)
 
         preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
-        return f'🔄 Background task started: "{preview}"\nTask ID: {task_id}\nYou can keep chatting — results will appear when done.'
+        lines = [
+            f'🔄 Background task started: "{preview}"',
+            f"Task ID: {task_id}",
+        ]
+        if job_id:
+            lines.append(f"Job ID: {job_id}")
+        lines.append("You can keep chatting — results will appear when done.")
+        return "\n".join(lines)
 
     async def _run_background_task(
-        self, prompt: str, source: "SessionSource", task_id: str
+        self, prompt: str, source: "SessionSource", task_id: str, *, job_id: str = ""
     ) -> None:
         """Execute a background agent task and deliver the result to the chat."""
         from run_agent import AIAgent
@@ -6028,17 +6331,70 @@ class GatewayRunner:
         adapter = self.adapters.get(source.platform)
         if not adapter:
             logger.warning("No adapter for platform %s in background task %s", source.platform, task_id)
+            if job_id:
+                try:
+                    from agent.background_jobs import update_job
+
+                    update_job(
+                        job_id,
+                        status="failed",
+                        blocker=f"No adapter for platform {source.platform}",
+                        current_focus="Background task could not start.",
+                        next_step="Restore the platform adapter and retry the task.",
+                        runner_runtime="hermes",
+                        runner_pid=os.getpid(),
+                    )
+                except Exception:
+                    logger.debug("Failed to mark background job %s as failed", job_id, exc_info=True)
             return
 
         _thread_metadata = {"thread_id": source.thread_id} if source.thread_id else None
+        _job_event = None
+        _job_update = None
+        if job_id:
+            try:
+                from agent.background_jobs import append_job_event, update_job
+
+                _job_event = append_job_event
+                _job_update = update_job
+            except Exception:
+                logger.debug("Background job helpers unavailable for %s", task_id, exc_info=True)
 
         try:
+            if _job_update is not None:
+                _job_update(
+                    job_id,
+                    status="running",
+                    executor="gateway-background",
+                    runner_runtime="hermes",
+                    runner_pid=os.getpid(),
+                    current_focus="Gateway background task is running.",
+                    next_step="Wait for Hermes to finish the background conversation and deliver the result.",
+                )
+            if _job_event is not None:
+                _job_event(
+                    job_id,
+                    kind="started",
+                    status="running",
+                    message=f"Started gateway background task {task_id}.",
+                )
+
             user_config = _load_gateway_config()
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 source=source,
                 user_config=user_config,
             )
             if not runtime_kwargs.get("api_key"):
+                if _job_update is not None:
+                    _job_update(
+                        job_id,
+                        status="failed",
+                        blocker="No provider credentials configured.",
+                        current_focus="Background task failed before execution.",
+                        next_step="Configure provider credentials and rerun the task.",
+                        runner_runtime="hermes",
+                        runner_pid=os.getpid(),
+                    )
                 await adapter.send(
                     source.chat_id,
                     f"❌ Background task {task_id} failed: no provider credentials configured.",
@@ -6094,6 +6450,24 @@ class GatewayRunner:
             response = result.get("final_response", "") if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
+            if _job_update is not None:
+                _job_update(
+                    job_id,
+                    status="completed",
+                    result=response or "(No response generated)",
+                    blocker="",
+                    current_focus="Background task completed.",
+                    next_step="Result delivered back to the chat.",
+                    runner_runtime="hermes",
+                    runner_pid=os.getpid(),
+                )
+            if _job_event is not None:
+                _job_event(
+                    job_id,
+                    kind="completed",
+                    status="completed",
+                    message=f"Gateway background task {task_id} completed.",
+                )
 
             # Extract media files from the response
             if response:
@@ -6146,6 +6520,23 @@ class GatewayRunner:
 
         except Exception as e:
             logger.exception("Background task %s failed", task_id)
+            if _job_update is not None:
+                _job_update(
+                    job_id,
+                    status="failed",
+                    blocker=str(e),
+                    current_focus="Background task failed.",
+                    next_step="Inspect the error and retry if needed.",
+                    runner_runtime="hermes",
+                    runner_pid=os.getpid(),
+                )
+            if _job_event is not None:
+                _job_event(
+                    job_id,
+                    kind="failed",
+                    status="failed",
+                    message=f"{type(e).__name__}: {e}",
+                )
             try:
                 await adapter.send(
                     chat_id=source.chat_id,
@@ -8931,7 +9322,12 @@ class GatewayRunner:
                 except Exception as _e:
                     logger.debug("interim_assistant_callback error: %s", _e)
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
+            turn_route = self._resolve_turn_agent_config(
+                message,
+                model,
+                runtime_kwargs,
+                source=source,
+            )
 
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
@@ -9246,12 +9642,31 @@ class GatewayRunner:
             _resolved_model = getattr(_agent, "model", None) if _agent else None
 
             if not final_response:
-                error_msg = f"⚠️ {result['error']}" if result.get("error") else ""
+                raw_error = str(result.get("error") or "").strip()
+                error_msg = self._humanize_agent_failure(raw_error) if raw_error else ""
+                failed = bool(result.get("failed", False))
+                if not error_msg:
+                    _previewed = bool(result.get("response_previewed"))
+                    _partially_streamed = bool(
+                        _stream_consumer is not None
+                        and getattr(_stream_consumer, "already_sent", False)
+                    )
+                    if _previewed or _partially_streamed:
+                        error_msg = (
+                            "⚠️ The reply was interrupted before a complete result was produced. "
+                            "Please retry in a moment."
+                        )
+                    else:
+                        error_msg = (
+                            "⚠️ The request finished without a usable reply. "
+                            "Please retry in a moment."
+                        )
+                    failed = True
                 return {
                     "final_response": error_msg,
                     "messages": result.get("messages", []),
                     "api_calls": result.get("api_calls", 0),
-                    "failed": result.get("failed", False),
+                    "failed": failed,
                     "compression_exhausted": result.get("compression_exhausted", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": len(agent_history),
