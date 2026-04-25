@@ -1,5 +1,14 @@
 # Hermes Agent - Development Guide
 
+## Resume Entry
+
+When resuming integration or boundary work, read in this order:
+
+1. `HANDOFF.md`
+2. `RUNBOOK.md`
+3. `docs/MEMORY_OWNERSHIP.md`
+4. `README.md`
+
 Instructions for AI coding assistants and developers working on the hermes-agent codebase.
 
 ## Development Environment
