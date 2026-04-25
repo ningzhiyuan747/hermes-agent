@@ -7,13 +7,17 @@ from pathlib import Path
 from typing import Any
 
 from agent.background_jobs import list_jobs
-from agent.business_db import get_task, list_capability_runs, list_tasks
+from agent.business_db import get_task, list_approvals, list_capability_runs, list_tasks
+from agent.task_runtime_summary import (
+    ACTIVE_JOB_STATUSES,
+    ACTIVE_RUN_STATUSES,
+    ACTIVE_TASK_STATUSES,
+    build_task_runtime_snapshot,
+    enrich_task_control_summary,
+)
 from agent.task_reconcile_service import reconcile_task_records
 from scripts.subagent_task_status import _load_task_meta
 
-ACTIVE_TASK_STATUSES = {"open", "queued", "running", "pending_approval", "blocked", "paused"}
-ACTIVE_RUN_STATUSES = {"queued", "running", "pending_approval", "blocked", "paused"}
-ACTIVE_JOB_STATUSES = {"queued", "running", "paused", "blocked"}
 ACTIVE_SUBAGENT_STATUSES = {"created", "running"}
 TERMINAL_TASK_STATUSES = {"completed", "failed", "cancelled"}
 
@@ -93,14 +97,21 @@ def _task_id_from_scope_key(task_scope_key: str) -> str:
 
 
 def _task_failure_summary(*, task_units: list[dict[str, Any]], limit: int) -> dict[str, dict[str, int]]:
+    def _delivery_platform(unit: dict[str, Any]) -> str:
+        target = str(unit.get("delivery_target") or "").strip()
+        if ":" in target:
+            return target.split(":", 1)[0].strip().lower()
+        return ""
+
     return {
         "failure_kinds": _top_nonempty_counts([str(unit.get("failure_kind") or "") for unit in task_units], limit=limit),
         "delivery_statuses": _top_nonempty_counts([str(unit.get("delivery_status") or "") for unit in task_units], limit=limit),
         "dispatch_actions": _top_nonempty_counts([str(unit.get("dispatch_action") or "") for unit in task_units], limit=limit),
         "delivery_platforms": _top_nonempty_counts(
             [
-                str(unit.get("origin_platform") or "")
+                _delivery_platform(unit)
                 for unit in task_units
+                if _delivery_platform(unit)
                 if str(unit.get("delivery_status") or "").strip().lower() == "failed"
                 or str(unit.get("failure_kind") or "").strip().lower() in {"credential_failed", "routing_failed", "delivery_failed"}
             ],
@@ -273,11 +284,19 @@ def _run_unit(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
+def _task_unit(row: dict[str, Any], *, control_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     task_id = str(row.get("task_id") or "").strip()
     source_session_id = str(row.get("source_session_id") or "").strip()
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    control_plane = metadata.get("control_plane") if isinstance(metadata.get("control_plane"), dict) else {}
+    control_summary = (
+        control_summary
+        if isinstance(control_summary, dict)
+        else (
+            metadata.get("control_plane")
+            if isinstance(metadata.get("control_plane"), dict)
+            else {}
+        )
+    )
     origin = {
         "platform": str(row.get("source_platform") or "").strip().lower(),
         "chat_id": str(row.get("source_chat_id") or "").strip(),
@@ -288,8 +307,8 @@ def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
         actor_user_id=str(row.get("owner_user_id") or "").strip(),
         task_id=task_id,
     )
-    task_scope_key = str(control_plane.get("task_scope_key") or "").strip() or str(scopes.get("task_scope_key") or "").strip()
-    person_memory_key = str(control_plane.get("person_memory_key") or "").strip() or str(scopes.get("person_memory_key") or "").strip()
+    task_scope_key = str(control_summary.get("task_scope_key") or "").strip() or str(scopes.get("task_scope_key") or "").strip()
+    person_memory_key = str(control_summary.get("person_memory_key") or "").strip() or str(scopes.get("person_memory_key") or "").strip()
     conversation_role = str(scopes.get("conversation_role") or "task_unit").strip()
     if task_scope_key.startswith("dingtalk:chat:"):
         conversation_role = "task_group"
@@ -297,29 +316,30 @@ def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
         conversation_role = "task_unit"
     elif task_scope_key:
         conversation_role = "chat_surface"
-    status = str(control_plane.get("status") or row.get("status") or "unknown").strip().lower()
-    current_focus = str(control_plane.get("current_focus") or "").strip()
-    next_step = str(control_plane.get("next_step") or "").strip()
-    blocker = str(control_plane.get("blocker") or "").strip()
-    failure_kind = str(control_plane.get("failure_kind") or "").strip()
-    execution_status = str(control_plane.get("execution_status") or "").strip()
-    delivery_status = str(control_plane.get("delivery_status") or "").strip()
-    recovery_hint = str(control_plane.get("recovery_hint") or "").strip()
-    dispatch_action = str(control_plane.get("dispatch_action") or "").strip()
-    suggested_executor = str(control_plane.get("suggested_executor") or "").strip()
-    last_secretary_action = str(control_plane.get("last_secretary_action") or "").strip()
-    last_secretary_action_summary = str(control_plane.get("last_secretary_action_summary") or "").strip()
-    requested_executor_override = str(control_plane.get("requested_executor_override") or "").strip()
-    last_follow_up_action_id = str(control_plane.get("last_follow_up_action_id") or "").strip()
-    last_follow_up_ok = bool(control_plane.get("last_follow_up_ok"))
-    last_follow_up_at_unix = int(control_plane.get("last_follow_up_at_unix") or 0)
-    last_follow_up_summary = str(control_plane.get("last_follow_up_summary") or "").strip()
-    last_follow_up_target_ref = str(control_plane.get("last_follow_up_target_ref") or "").strip()
-    operator_queue_count = int(control_plane.get("operator_queue_count") or 0)
-    operator_queue_next = str(control_plane.get("operator_queue_next") or "").strip()
-    last_operator_resolution = str(control_plane.get("last_operator_resolution") or "").strip()
-    last_operator_resolution_summary = str(control_plane.get("last_operator_resolution_summary") or "").strip()
-    activity_updated_at_unix = int(control_plane.get("activity_updated_at_unix") or 0)
+    status = str(control_summary.get("status") or row.get("status") or "unknown").strip().lower()
+    current_focus = str(control_summary.get("current_focus") or "").strip()
+    next_step = str(control_summary.get("next_step") or "").strip()
+    blocker = str(control_summary.get("blocker") or "").strip()
+    failure_kind = str(control_summary.get("failure_kind") or "").strip()
+    execution_status = str(control_summary.get("execution_status") or "").strip()
+    delivery_status = str(control_summary.get("delivery_status") or "").strip()
+    delivery_target = str(control_summary.get("delivery_target") or "").strip()
+    recovery_hint = str(control_summary.get("recovery_hint") or "").strip()
+    dispatch_action = str(control_summary.get("dispatch_action") or "").strip()
+    suggested_executor = str(control_summary.get("suggested_executor") or "").strip()
+    last_secretary_action = str(control_summary.get("last_secretary_action") or "").strip()
+    last_secretary_action_summary = str(control_summary.get("last_secretary_action_summary") or "").strip()
+    requested_executor_override = str(control_summary.get("requested_executor_override") or "").strip()
+    last_follow_up_action_id = str(control_summary.get("last_follow_up_action_id") or "").strip()
+    last_follow_up_ok = bool(control_summary.get("last_follow_up_ok"))
+    last_follow_up_at_unix = int(control_summary.get("last_follow_up_at_unix") or 0)
+    last_follow_up_summary = str(control_summary.get("last_follow_up_summary") or "").strip()
+    last_follow_up_target_ref = str(control_summary.get("last_follow_up_target_ref") or "").strip()
+    operator_queue_count = int(control_summary.get("operator_queue_count") or 0)
+    operator_queue_next = str(control_summary.get("operator_queue_next") or "").strip()
+    last_operator_resolution = str(control_summary.get("last_operator_resolution") or "").strip()
+    last_operator_resolution_summary = str(control_summary.get("last_operator_resolution_summary") or "").strip()
+    activity_updated_at_unix = int(control_summary.get("activity_updated_at_unix") or 0)
     is_active = status in ACTIVE_TASK_STATUSES and (
         status != "open" or bool(current_focus or next_step or blocker)
     )
@@ -336,6 +356,7 @@ def _task_unit(row: dict[str, Any]) -> dict[str, Any]:
         "failure_kind": failure_kind,
         "execution_status": execution_status,
         "delivery_status": delivery_status,
+        "delivery_target": delivery_target,
         "recovery_hint": recovery_hint,
         "dispatch_action": dispatch_action,
         "suggested_executor": suggested_executor,
@@ -608,9 +629,29 @@ def build_operational_task_snapshot(*, limit: int = 20) -> dict[str, Any]:
     tasks = list_tasks(limit=max(20, limit * 4))
     runs = list_capability_runs(limit=max(20, limit * 4))
     jobs = list_jobs(limit=max(20, limit * 4), active_only=False)
+    approval_rows = list_approvals(status="pending", limit=max(20, limit * 8))
     subagents = _load_task_meta()
 
-    task_units = [_task_unit(row) for row in tasks]
+    task_units = [
+        _task_unit(
+            row,
+            control_summary=enrich_task_control_summary(
+                row,
+                dict(
+                    build_task_runtime_snapshot(
+                        row,
+                        runs=runs,
+                        jobs=jobs,
+                        approval_rows=approval_rows,
+                        delegation_rows=subagents,
+                        active_only=False,
+                    ).get("control_summary")
+                    or {}
+                ),
+            ),
+        )
+        for row in tasks
+    ]
     run_units = [_run_unit(row) for row in runs]
     job_units = [_job_unit(row) for row in jobs]
     parent_scopes = _session_scope_index(task_units=task_units, run_units=run_units, job_units=job_units)

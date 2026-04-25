@@ -208,8 +208,8 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
         },
     }
     assert snapshot["task_failure_summary"] == {
-        "failure_kinds": {},
-        "delivery_statuses": {"pending": 1},
+        "failure_kinds": {"credential_failed": 1},
+        "delivery_statuses": {"failed": 1},
         "dispatch_actions": {"continue_current": 1},
         "delivery_platforms": {},
     }
@@ -217,14 +217,14 @@ def test_build_operational_task_units_normalizes_runs_jobs_and_subagents(monkeyp
     first = snapshot["units"][0]
     assert first["unit_id"] == "task:task-1"
     assert first["unit_type"] == "task"
-    assert first["current_focus"] == "Queued for worker"
-    assert first["next_step"] == "Dispatch worker"
-    assert first["failure_kind"] == ""
+    assert first["current_focus"] == "Check watchdog chain"
+    assert first["next_step"] == "Inspect traceback"
+    assert first["failure_kind"] == "credential_failed"
     assert first["execution_status"] == "queued"
-    assert first["delivery_status"] == "pending"
-    assert first["recovery_hint"] == "Wait for the current executor to finish and capture the result."
+    assert first["delivery_status"] == "failed"
+    assert first["recovery_hint"] == "Repair platform credentials and redeliver the existing result."
     assert first["dispatch_action"] == "continue_current"
-    assert first["suggested_executor"] == "openclaw"
+    assert first["suggested_executor"] == "hermes"
     assert first["last_secretary_action"] == "retry_delivery"
     assert first["last_follow_up_action_id"] == "wait_approval:task-1"
     assert first["last_follow_up_target_ref"] == "weixin:wx-1"
