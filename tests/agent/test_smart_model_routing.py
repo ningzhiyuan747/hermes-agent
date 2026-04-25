@@ -1,4 +1,4 @@
-from agent.smart_model_routing import choose_cheap_model_route
+from agent.smart_model_routing import choose_cheap_model_route, choose_high_value_model_route
 
 
 _BASE_CONFIG = {
@@ -6,6 +6,13 @@ _BASE_CONFIG = {
     "cheap_model": {
         "provider": "openrouter",
         "model": "google/gemini-2.5-flash",
+    },
+    "high_value_model": {
+        "provider": "custom",
+        "model": "claude-opus-4-7",
+        "base_url": "https://api.ccode.vip/v1",
+        "api_key_env": "HERMES_OPUS47_API_KEY",
+        "keywords": ["按模板", "报价单", "承诺书", "招标", "research"],
     },
 }
 
@@ -21,6 +28,45 @@ def test_routes_short_simple_prompt():
     assert result["provider"] == "openrouter"
     assert result["model"] == "google/gemini-2.5-flash"
     assert result["routing_reason"] == "simple_turn"
+
+
+def test_routes_high_value_template_prompt():
+    result = choose_high_value_model_route("按模板生成一份信用承诺书", _BASE_CONFIG)
+    assert result is not None
+    assert result["provider"] == "custom"
+    assert result["model"] == "claude-opus-4-7"
+    assert result["routing_reason"] == "high_value_turn"
+
+
+def test_resolve_turn_route_prefers_high_value_route(monkeypatch):
+    from agent.smart_model_routing import resolve_turn_route
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        lambda **kwargs: {
+            "provider": "custom",
+            "base_url": "https://api.ccode.vip/v1",
+            "api_mode": "chat_completions",
+            "api_key": "sk-opus",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        },
+    )
+    result = resolve_turn_route(
+        "按模板生成一份报价单样稿",
+        _BASE_CONFIG,
+        {
+            "model": "gpt-5.4",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_mode": "codex_responses",
+            "api_key": "sk-primary",
+        },
+    )
+    assert result["model"] == "claude-opus-4-7"
+    assert result["runtime"]["provider"] == "custom"
+    assert result["label"] == "smart route → claude-opus-4-7 (custom)"
 
 
 def test_skips_long_prompt():

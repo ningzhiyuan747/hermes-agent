@@ -1269,6 +1269,14 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
             )
         return changed, active_sources
 
+    # Copilot env-based credentials are already resolved in
+    # _seed_from_singletons() via resolve_copilot_token(), which normalizes
+    # both `gh auth token` and env-backed tokens into a single source of truth.
+    # Running the generic env seeding here would duplicate entries whenever
+    # GH_TOKEN / GITHUB_TOKEN is set in the shell environment.
+    if provider == "copilot":
+        return changed, active_sources
+
     pconfig = PROVIDER_REGISTRY.get(provider)
     if not pconfig or pconfig.auth_type != AUTH_TYPE_API_KEY:
         return changed, active_sources

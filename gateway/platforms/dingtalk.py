@@ -18,6 +18,7 @@ Configuration in config.yaml:
 """
 
 import asyncio
+import inspect
 import logging
 import os
 import re
@@ -48,13 +49,25 @@ from gateway.platforms.base import (
     MessageType,
     SendResult,
 )
+from gateway.platforms.adapter_context import build_adapter_context_for_event
+from gateway.session import build_session_key
 
 logger = logging.getLogger(__name__)
 
 MAX_MESSAGE_LENGTH = 20000
 RECONNECT_BACKOFF = [2, 5, 10, 30, 60]
 _SESSION_WEBHOOKS_MAX = 500
-_DINGTALK_WEBHOOK_RE = re.compile(r'^https://api\.dingtalk\.com/')
+_DINGTALK_WEBHOOK_RE = re.compile(r"^https://(?:api|oapi)\.dingtalk\.com/")
+
+try:
+    from agent.business_command_service import dispatch_business_text_command
+    from agent.business_db import get_channel, get_user, upsert_channel, upsert_user
+except Exception:  # pragma: no cover - gateway should still boot without business DB.
+    dispatch_business_text_command = None  # type: ignore[assignment]
+    get_channel = None  # type: ignore[assignment]
+    get_user = None  # type: ignore[assignment]
+    upsert_channel = None  # type: ignore[assignment]
+    upsert_user = None  # type: ignore[assignment]
 
 
 def check_dingtalk_requirements() -> bool:
@@ -86,6 +99,16 @@ class DingTalkAdapter(BasePlatformAdapter):
         self._stream_client: Any = None
         self._stream_task: Optional[asyncio.Task] = None
         self._http_client: Optional["httpx.AsyncClient"] = None
+        owner_ids = (
+            extra.get("owner_user_ids")
+            or os.getenv("DINGTALK_OWNER_USER_IDS", "")
+            or os.getenv("DINGTALK_OWNER_IDS", "")
+        )
+        self._owner_user_ids = {
+            str(item).strip()
+            for item in (owner_ids.split(",") if isinstance(owner_ids, str) else owner_ids or [])
+            if str(item).strip()
+        }
 
         # Message deduplication
         self._dedup = MessageDeduplicator(max_size=1000)
@@ -133,7 +156,9 @@ class DingTalkAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 logger.debug("[%s] Starting stream client...", self.name)
-                await asyncio.to_thread(self._stream_client.start)
+                start_result = await asyncio.to_thread(self._stream_client.start)
+                if inspect.isawaitable(start_result):
+                    await start_result
             except asyncio.CancelledError:
                 return
             except Exception as e:
@@ -232,6 +257,10 @@ class DingTalkAdapter(BasePlatformAdapter):
             timestamp=timestamp,
         )
 
+        self._sync_business_identity(event)
+        if await self._handle_native_business_command(event, session_webhook=session_webhook):
+            return
+
         logger.debug("[%s] Message from %s in %s: %s",
                       self.name, sender_nick, chat_id[:20] if chat_id else "?", text[:50])
         await self.handle_message(event)
@@ -242,6 +271,8 @@ class DingTalkAdapter(BasePlatformAdapter):
         text = getattr(message, "text", None) or ""
         if isinstance(text, dict):
             content = text.get("content", "").strip()
+        elif hasattr(text, "content"):
+            content = str(getattr(text, "content", "") or "").strip()
         else:
             content = str(text).strip()
 
@@ -300,6 +331,97 @@ class DingTalkAdapter(BasePlatformAdapter):
         """Return basic info about a DingTalk conversation."""
         return {"name": chat_id, "type": "group" if "group" in chat_id.lower() else "dm"}
 
+    async def _send_plain(self, event: MessageEvent, text: str, *, session_webhook: str = "") -> SendResult:
+        metadata = {"session_webhook": session_webhook} if session_webhook else None
+        return await self.send(
+            str(event.source.chat_id or "").strip(),
+            text,
+            reply_to=event.message_id,
+            metadata=metadata,
+        )
+
+    def _is_owner_or_admin(self, event: MessageEvent) -> bool:
+        sender_ids = {
+            str(event.source.user_id or "").strip(),
+            str(getattr(event.source, "user_id_alt", "") or "").strip(),
+        } - {""}
+        if sender_ids & self._owner_user_ids:
+            return True
+        if get_user is None:
+            return False
+        for identifier in sender_ids:
+            try:
+                user = get_user(platform="dingtalk", user_id=identifier)
+            except Exception:
+                continue
+            if str((user or {}).get("role") or "").strip().lower() == "owner":
+                return True
+        return False
+
+    def _sync_business_identity(self, event: MessageEvent) -> None:
+        if upsert_user is None or upsert_channel is None:
+            return
+        try:
+            sender_ids = {
+                str(event.source.user_id or "").strip(),
+                str(getattr(event.source, "user_id_alt", "") or "").strip(),
+            } - {""}
+            preferred_user_id = str(getattr(event.source, "user_id_alt", "") or event.source.user_id or "").strip()
+            existing_user = get_user(platform="dingtalk", user_id=preferred_user_id) if get_user is not None and preferred_user_id else {}
+            role = "owner" if sender_ids & self._owner_user_ids else str((existing_user or {}).get("role") or "user").strip().lower() or "user"
+            permissions = dict((existing_user or {}).get("permissions") or {}) if isinstance((existing_user or {}).get("permissions"), dict) else {}
+            if role == "owner":
+                permissions["bypass_approval"] = True
+                permissions["global_owner"] = True
+            if preferred_user_id:
+                upsert_user(
+                    platform="dingtalk",
+                    user_id=preferred_user_id,
+                    display_name=str(event.source.user_name or "").strip(),
+                    role=role,
+                    permissions=permissions,
+                )
+            existing_channel = get_channel(
+                platform="dingtalk",
+                chat_id=str(event.source.chat_id or "").strip(),
+                thread_id=str(event.source.thread_id or "").strip(),
+            ) if get_channel is not None else {}
+            upsert_channel(
+                platform="dingtalk",
+                chat_id=str(event.source.chat_id or "").strip(),
+                thread_id=str(event.source.thread_id or "").strip(),
+                task_id=str((existing_channel or {}).get("task_id") or "").strip(),
+                chat_name=str(event.source.chat_name or "").strip(),
+                chat_type=str(event.source.chat_type or "").strip(),
+                worker_role=str((existing_channel or {}).get("worker_role") or "").strip(),
+                allow_free_chat=bool((existing_channel or {}).get("allow_free_chat")) or str(event.source.chat_type or "").strip() == "dm",
+                policy=(existing_channel or {}).get("policy") or {},
+            )
+        except Exception:
+            logger.debug("[DingTalk] Failed to sync business identity", exc_info=True)
+
+    async def _handle_native_business_command(self, event: MessageEvent, *, session_webhook: str = "") -> bool:
+        if dispatch_business_text_command is None:
+            return False
+        session_key = build_session_key(
+            event.source,
+            group_sessions_per_user=self.config.extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=self.config.extra.get("thread_sessions_per_user", False),
+        )
+        context = build_adapter_context_for_event(
+            event,
+            platform_name="dingtalk",
+            session_key=session_key,
+        )
+        response = dispatch_business_text_command(
+            context.incoming_message,
+            can_manage_bindings=self._is_owner_or_admin(event),
+        )
+        if not response:
+            return False
+        await self._send_plain(event, response, session_webhook=session_webhook)
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Internal stream handler
@@ -314,19 +436,24 @@ class _IncomingHandler(ChatbotHandler if DINGTALK_STREAM_AVAILABLE else object):
         self._adapter = adapter
         self._loop = loop
 
-    def process(self, message: "ChatbotMessage"):
-        """Called by dingtalk-stream in its thread when a message arrives.
+    @staticmethod
+    def _normalize_message(message: Any) -> "ChatbotMessage":
+        if (
+            DINGTALK_STREAM_AVAILABLE
+            and hasattr(message, "data")
+            and isinstance(getattr(message, "data", None), dict)
+        ):
+            return dingtalk_stream.ChatbotMessage.from_dict(message.data)
+        return message
 
-        Schedules the async handler on the main event loop.
+    async def process(self, message: Any):
+        """Called by dingtalk-stream when a callback arrives.
+
+        The SDK passes a CallbackMessage whose `.data` payload contains the
+        actual chatbot message body, so normalize it before dispatch.
         """
-        loop = self._loop
-        if loop is None or loop.is_closed():
-            logger.error("[DingTalk] Event loop unavailable, cannot dispatch message")
-            return dingtalk_stream.AckMessage.STATUS_OK, "OK"
-
-        future = asyncio.run_coroutine_threadsafe(self._adapter._on_message(message), loop)
         try:
-            future.result(timeout=60)
+            await self._adapter._on_message(self._normalize_message(message))
         except Exception:
             logger.exception("[DingTalk] Error processing incoming message")
 

@@ -1116,6 +1116,26 @@ def test_load_pool_does_not_seed_copilot_when_no_token(tmp_path, monkeypatch):
     assert pool.entries() == []
 
 
+def test_load_pool_does_not_duplicate_copilot_env_token(tmp_path, monkeypatch):
+    """Copilot env tokens should be seeded once through resolve_copilot_token()."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    _write_auth_store(tmp_path, {"version": 1, "credential_pool": {}})
+    monkeypatch.setenv("GITHUB_TOKEN", "gho_env_token_abc123")
+
+    monkeypatch.setattr(
+        "hermes_cli.copilot_auth.resolve_copilot_token",
+        lambda: ("gho_env_token_abc123", "GITHUB_TOKEN"),
+    )
+
+    from agent.credential_pool import load_pool
+    pool = load_pool("copilot")
+
+    entries = pool.entries()
+    assert len(entries) == 1
+    assert entries[0].source == "env:GITHUB_TOKEN"
+    assert entries[0].access_token == "gho_env_token_abc123"
+
+
 def test_load_pool_seeds_qwen_oauth_via_cli_tokens(tmp_path, monkeypatch):
     """Qwen OAuth credentials from ~/.qwen/oauth_creds.json should be seeded into the pool."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))

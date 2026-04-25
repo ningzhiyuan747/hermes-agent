@@ -119,7 +119,7 @@ class CapabilityRouteService:
                 fallback_executor_key=fallback_executor_key,
                 run_record=run_record,
                 user_reply=(
-                    f"已识别为 {capability} 任务，但当前需要审批后才能执行。\n审批ID：{approval_id or '-'}"
+                    f"已识别为 {capability} 任务，但当前需要业务审批后才能执行。\n业务审批ID：{approval_id or '-'}"
                 ),
             )
 

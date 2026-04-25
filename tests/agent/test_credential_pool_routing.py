@@ -15,6 +15,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch, PropertyMock
 
 import pytest
+from gateway.config import Platform
+from gateway.session import SessionSource
 
 
 # ---------------------------------------------------------------------------
@@ -161,9 +163,8 @@ class TestGatewayTurnRoutePool:
 
         from gateway.run import GatewayRunner
 
-        runner = SimpleNamespace(
-            _smart_model_routing={"enabled": False},
-        )
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._smart_model_routing = {"enabled": False}
 
         runtime_kwargs = {
             "api_key": "sk-test",
@@ -180,6 +181,109 @@ class TestGatewayTurnRoutePool:
 
         assert "credential_pool" in captured["primary"]
         assert captured["primary"]["credential_pool"] is runtime_kwargs["credential_pool"]
+
+    def test_owner_only_high_value_route_stays_on_primary_for_non_owner(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("FEISHU_OWNER_IDS", "owner-user")
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._smart_model_routing = {
+            "enabled": True,
+            "high_value_model": {
+                "provider": "custom",
+                "model": "claude-opus-4-7",
+                "base_url": "https://api.ccode.vip/v1",
+                "api_key_env": "HERMES_OPUS47_API_KEY",
+                "owner_only": True,
+                "keywords": ["按模板", "报价单"],
+            },
+        }
+
+        runtime_kwargs = {
+            "api_key": "sk-test",
+            "base_url": None,
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_test",
+            chat_type="dm",
+            user_id="guest-user",
+        )
+
+        route = GatewayRunner._resolve_turn_agent_config(
+            runner,
+            "按模板生成一份报价单",
+            "gpt-5.4",
+            runtime_kwargs,
+            source=source,
+        )
+
+        assert route["model"] == "gpt-5.4"
+        assert route["runtime"]["provider"] == "openai-codex"
+        assert route["label"] is None
+
+    def test_owner_only_high_value_route_applies_for_owner(self, monkeypatch):
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("FEISHU_OWNER_IDS", "owner-user")
+        monkeypatch.setattr(
+            "hermes_cli.runtime_provider.resolve_runtime_provider",
+            lambda **kwargs: {
+                "provider": "custom",
+                "base_url": "https://api.ccode.vip/v1",
+                "api_mode": "chat_completions",
+                "api_key": "sk-opus",
+                "command": None,
+                "args": [],
+                "credential_pool": None,
+            },
+        )
+
+        runner = GatewayRunner.__new__(GatewayRunner)
+        runner._smart_model_routing = {
+            "enabled": True,
+            "high_value_model": {
+                "provider": "custom",
+                "model": "claude-opus-4-7",
+                "base_url": "https://api.ccode.vip/v1",
+                "api_key_env": "HERMES_OPUS47_API_KEY",
+                "owner_only": True,
+                "keywords": ["按模板", "报价单"],
+            },
+        }
+
+        runtime_kwargs = {
+            "api_key": "sk-test",
+            "base_url": None,
+            "provider": "openai-codex",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": [],
+            "credential_pool": None,
+        }
+        source = SessionSource(
+            platform=Platform.FEISHU,
+            chat_id="oc_test",
+            chat_type="dm",
+            user_id="owner-user",
+        )
+
+        route = GatewayRunner._resolve_turn_agent_config(
+            runner,
+            "按模板生成一份报价单",
+            "gpt-5.4",
+            runtime_kwargs,
+            source=source,
+        )
+
+        assert route["model"] == "claude-opus-4-7"
+        assert route["runtime"]["provider"] == "custom"
 
 
 # ---------------------------------------------------------------------------

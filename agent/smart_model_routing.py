@@ -47,6 +47,50 @@ _COMPLEX_KEYWORDS = {
 
 _URL_RE = re.compile(r"https?://|www\.", re.IGNORECASE)
 
+_DEFAULT_HIGH_VALUE_KEYWORDS = {
+    "招标",
+    "投标",
+    "标书",
+    "中标",
+    "报价单",
+    "报价表",
+    "承诺书",
+    "授权书",
+    "授权证明",
+    "合同",
+    "采购",
+    "申购",
+    "论证",
+    "参数表",
+    "需求表",
+    "调查报告",
+    "技术参数",
+    "按模板",
+    "模板",
+    "改稿",
+    "润色",
+    "重写",
+    "总结",
+    "汇总",
+    "比对",
+    "对比",
+    "研究",
+    "检索",
+    "research",
+    "tender",
+    "bid",
+    "quote",
+    "quotation",
+    "contract",
+    "proposal",
+    "template",
+    "rewrite",
+    "polish",
+    "summarize",
+    "summary",
+    "compare",
+}
+
 
 def _coerce_bool(value: Any, default: bool = False) -> bool:
     return is_truthy_value(value, default=default)
@@ -57,6 +101,42 @@ def _coerce_int(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def choose_high_value_model_route(user_message: str, routing_config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Return the configured strong-model route for high-value tasks."""
+    cfg = routing_config or {}
+    if not _coerce_bool(cfg.get("enabled"), False):
+        return None
+
+    high_value_model = cfg.get("high_value_model") or {}
+    if not isinstance(high_value_model, dict):
+        return None
+    provider = str(high_value_model.get("provider") or "").strip().lower()
+    model = str(high_value_model.get("model") or "").strip()
+    if not provider or not model:
+        return None
+
+    text = (user_message or "").strip()
+    if not text:
+        return None
+
+    lowered = text.lower()
+    configured_keywords = {
+        str(item).strip().lower()
+        for item in (high_value_model.get("keywords") or [])
+        if str(item).strip()
+    }
+    keywords = configured_keywords or {item.lower() for item in _DEFAULT_HIGH_VALUE_KEYWORDS}
+
+    if not any(keyword and keyword in lowered for keyword in keywords):
+        return None
+
+    route = dict(high_value_model)
+    route["provider"] = provider
+    route["model"] = model
+    route["routing_reason"] = "high_value_turn"
+    return route
 
 
 def choose_cheap_model_route(user_message: str, routing_config: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -112,7 +192,9 @@ def resolve_turn_route(user_message: str, routing_config: Optional[Dict[str, Any
 
     Returns a dict with model/runtime/signature/label fields.
     """
-    route = choose_cheap_model_route(user_message, routing_config)
+    route = choose_high_value_model_route(user_message, routing_config)
+    if not route:
+        route = choose_cheap_model_route(user_message, routing_config)
     if not route:
         return {
             "model": primary.get("model"),
