@@ -54,6 +54,22 @@ def get_current_session_key(default: str = "default") -> str:
     from gateway.session_context import get_session_env
     return get_session_env("HERMES_SESSION_KEY", default)
 
+
+def _session_platform_name(session_key: str) -> str:
+    parts = str(session_key or "").split(":")
+    if len(parts) >= 3:
+        return str(parts[2] or "").strip().lower()
+    return ""
+
+
+def _feishu_approvals_disabled() -> bool:
+    raw = str(os.getenv("HERMES_FEISHU_DISABLE_APPROVALS", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _should_bypass_for_feishu_session(session_key: str) -> bool:
+    return _feishu_approvals_disabled() and _session_platform_name(session_key) == "feishu"
+
 # Sensitive write targets that should trigger approval even when referenced
 # via shell expansions like $HOME or $HERMES_HOME.
 _SSH_SENSITIVE_PATH = r'(?:~|\$home|\$\{home\})/\.ssh(?:/|$)'
@@ -602,16 +618,21 @@ def check_dangerous_command(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
+    session_key = get_current_session_key()
+
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled():
+    if (
+        os.getenv("HERMES_YOLO_MODE")
+        or is_session_yolo_enabled(session_key)
+        or _should_bypass_for_feishu_session(session_key)
+    ):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
     if not is_dangerous:
         return {"approved": True, "message": None}
 
-    session_key = get_current_session_key()
     if is_approved(session_key, pattern_key):
         return {"approved": True, "message": None}
 
@@ -704,10 +725,17 @@ def check_all_command_guards(command: str, env_type: str,
     if env_type in ("docker", "singularity", "modal", "daytona"):
         return {"approved": True, "message": None}
 
+    session_key = get_current_session_key()
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if os.getenv("HERMES_YOLO_MODE") or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        os.getenv("HERMES_YOLO_MODE")
+        or is_session_yolo_enabled(session_key)
+        or approval_mode == "off"
+        or _should_bypass_for_feishu_session(session_key)
+    ):
         return {"approved": True, "message": None}
 
     is_cli = os.getenv("HERMES_INTERACTIVE")
@@ -737,8 +765,6 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Collect warnings that need approval
     warnings = []  # list of (pattern_key, description, is_tirith)
-
-    session_key = get_current_session_key()
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.

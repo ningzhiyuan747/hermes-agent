@@ -287,6 +287,76 @@ _cached_agent_browser: Optional[str] = None
 _agent_browser_resolved = False
 
 
+def get_browser_backend_status() -> dict[str, Any]:
+    """Return a grounded summary of the currently selected browser backend.
+
+    This is used by CLI status surfaces so users can see not just *which* mode
+    is selected, but whether the configured endpoint is actually reachable and,
+    for CDP discovery URLs, what concrete websocket/browser metadata was found.
+    """
+
+    current = os.environ.get("BROWSER_CDP_URL", "").strip()
+    status: dict[str, Any] = {
+        "mode": "local",
+        "label": "local headless Chromium (agent-browser)",
+        "connected": False,
+    }
+
+    if current:
+        status.update(
+            {
+                "mode": "cdp",
+                "label": "live Chrome via CDP",
+                "connected": True,
+                "endpoint": current,
+            }
+        )
+        resolved = _resolve_cdp_override(current)
+        if resolved and resolved != current:
+            status["resolved_endpoint"] = resolved
+
+        version_url = current.rstrip("/") + "/json/version"
+        if current.lower().endswith("/json/version"):
+            version_url = current
+        elif "/devtools/browser/" in current.lower():
+            version_url = ""
+
+        if version_url:
+            try:
+                response = requests.get(version_url, timeout=3)
+                response.raise_for_status()
+                payload = response.json()
+                status["reachable"] = True
+                browser = str(payload.get("Browser") or "").strip()
+                if browser:
+                    status["browser_version"] = browser
+                title = str(payload.get("windowTitle") or "").strip()
+                if title:
+                    status["window_title"] = title
+                ws_url = str(payload.get("webSocketDebuggerUrl") or "").strip()
+                if ws_url:
+                    status["discovered_websocket"] = ws_url
+            except Exception as exc:
+                status["reachable"] = False
+                status["error"] = str(exc)
+        else:
+            # Direct websocket URLs cannot be probed via /json/version, but they
+            # are still useful to show explicitly in the status inventory.
+            status["reachable"] = None
+    else:
+        provider = _get_cloud_provider()
+        if provider is not None:
+            status.update(
+                {
+                    "mode": "cloud",
+                    "label": f"{provider.provider_name()} (cloud)",
+                    "provider": provider.provider_name(),
+                }
+            )
+
+    return status
+
+
 def _get_cloud_provider() -> Optional[CloudBrowserProvider]:
     """Return the configured cloud browser provider, or None for local mode.
 

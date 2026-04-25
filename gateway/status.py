@@ -162,6 +162,7 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "restart_requested": False,
         "active_agents": 0,
         "platforms": {},
+        "browser_backend": None,
         "updated_at": _utc_now_iso(),
     })
     return payload
@@ -223,10 +224,12 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
+    configured_platforms: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
+    browser_backend: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -245,6 +248,17 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = max(0, int(active_agents))
+    if configured_platforms is not _UNSET:
+        keep = {
+            str(item).strip()
+            for item in (configured_platforms or [])
+            if str(item).strip()
+        }
+        payload["platforms"] = {
+            key: value
+            for key, value in payload.get("platforms", {}).items()
+            if key in keep
+        }
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
@@ -256,6 +270,9 @@ def write_runtime_status(
             platform_payload["error_message"] = error_message
         platform_payload["updated_at"] = _utc_now_iso()
         payload["platforms"][platform] = platform_payload
+
+    if browser_backend is not _UNSET:
+        payload["browser_backend"] = browser_backend
 
     _write_json_file(path, payload)
 

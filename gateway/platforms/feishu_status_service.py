@@ -62,7 +62,7 @@ class FeishuStatusService:
     ) -> str:
         func = self.deps.format_approval_list_text_func
         if func is None:
-            return "审批列表暂不可用。"
+            return "业务审批列表暂不可用。"
         task_id, task_title = self.get_event_task_context(event)
         return func(rows, task_id=task_id, task_title=task_title, scope_all=scope_all)
 

@@ -6153,33 +6153,53 @@ class HermesCLI:
 
         elif sub == "status":
             print()
-            if current:
-                print("🌐 Browser: connected to live Chrome via CDP")
-                print(f"   Endpoint: {current}")
+            try:
+                from tools.browser_tool import get_browser_backend_status
+                browser_status = get_browser_backend_status()
+            except Exception:
+                browser_status = None
 
-                _port = 9222
-                try:
-                    _port = int(current.rsplit(":", 1)[-1].split("/")[0])
-                except (ValueError, IndexError):
-                    pass
-                try:
-                    import socket
-                    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                    s.settimeout(1)
-                    s.connect(("127.0.0.1", _port))
-                    s.close()
-                    print("   Status: ✓ reachable")
-                except (OSError, Exception):
-                    print("   Status: ⚠ not reachable (Chrome may not be running)")
+            if isinstance(browser_status, dict):
+                mode = str(browser_status.get("mode") or "").strip().lower()
+                label = str(browser_status.get("label") or "browser").strip()
+                print(f"🌐 Browser: {label}")
+                if mode == "cdp":
+                    endpoint = str(browser_status.get("endpoint") or current).strip()
+                    if endpoint:
+                        print(f"   Endpoint: {endpoint}")
+                    resolved_endpoint = str(browser_status.get("resolved_endpoint") or "").strip()
+                    if resolved_endpoint:
+                        print(f"   Resolved: {resolved_endpoint}")
+                    reachable = browser_status.get("reachable")
+                    if reachable is True:
+                        print("   Status: ✓ reachable")
+                    elif reachable is False:
+                        print("   Status: ⚠ not reachable")
+                        error_text = str(browser_status.get("error") or "").strip()
+                        if error_text:
+                            print(f"   Error: {error_text}")
+                    else:
+                        print("   Status: ? direct websocket (no HTTP probe)")
+
+                    browser_version = str(browser_status.get("browser_version") or "").strip()
+                    if browser_version:
+                        print(f"   Browser: {browser_version}")
+                    discovered_ws = str(browser_status.get("discovered_websocket") or "").strip()
+                    if discovered_ws:
+                        print(f"   WebSocket: {discovered_ws}")
+                    window_title = str(browser_status.get("window_title") or "").strip()
+                    if window_title:
+                        print(f"   Window: {window_title}")
+                elif mode == "cloud":
+                    provider_name = str(browser_status.get("provider") or "").strip()
+                    if provider_name:
+                        print(f"   Provider: {provider_name}")
+                else:
+                    print("   Mode: local")
             else:
-                try:
-                    from tools.browser_tool import _get_cloud_provider
-                    provider = _get_cloud_provider()
-                except Exception:
-                    provider = None
-
-                if provider is not None:
-                    print(f"🌐 Browser: {provider.provider_name()} (cloud)")
+                if current:
+                    print("🌐 Browser: connected to live Chrome via CDP")
+                    print(f"   Endpoint: {current}")
                 else:
                     print("🌐 Browser: local headless Chromium (agent-browser)")
             print()

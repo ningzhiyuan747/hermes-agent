@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sqlite3
 import time
@@ -10,7 +11,14 @@ from typing import Any, Dict, Iterable, Optional
 
 from agent.capability_execution_policy import get_capability_execution_policy
 from gateway.status import acquire_scoped_lock, release_scoped_lock
+from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import get_hermes_home
+
+
+load_hermes_dotenv(
+    hermes_home=get_hermes_home(),
+    project_env=Path(__file__).resolve().parents[1] / ".env",
+)
 
 
 SCHEMA_VERSION = 6
@@ -41,8 +49,23 @@ PRIVATE_CHAT_TYPES = {
     "single",
     "singlechat",
 }
+CONTROL_SURFACE_APPROVAL_BYPASS_PLATFORMS = {"feishu", "weixin"}
 ALLOWED_USER_MEMORY_SCOPES = {"profile", "notes", "distilled"}
 ALLOWED_TASK_MEMORY_SCOPES = {"shared"}
+
+
+def _business_approval_mode() -> str:
+    raw = str(os.getenv("HERMES_BUSINESS_APPROVAL_MODE", "owner_control_surface") or "").strip().lower()
+    if raw in {"off", "disabled", "disable", "false", "0", "no"}:
+        return "off"
+    if raw in {"enforce", "strict", "on", "enabled", "true", "1", "yes"}:
+        return "enforce"
+    return "owner_control_surface"
+
+
+def _feishu_approvals_disabled() -> bool:
+    raw = str(os.getenv("HERMES_FEISHU_DISABLE_APPROVALS", "") or "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
 
 
 def db_path() -> Path:
@@ -2238,15 +2261,46 @@ def evaluate_capability_access(
     risk_rank = RISK_RANK.get(risk, 2)
     max_auto = ROLE_MAX_AUTO_RISK.get(role, 1)
     approval_required = bool(cap.get("default_approval_required")) or risk_rank > max_auto
+    approval_mode = _business_approval_mode()
     if channel_policy.get("require_approval") is True:
         approval_required = True
-    if permissions.get("bypass_approval") is True and role in {"owner", "admin"}:
+    if approval_mode == "off":
         approval_required = False
+    elif str(platform or "").strip().lower() == "feishu" and _feishu_approvals_disabled():
+        approval_required = False
+    elif permissions.get("bypass_approval") is True and role in {"owner", "admin"}:
+        approval_required = False
+    elif (
+        approval_mode == "owner_control_surface"
+        and
+        role in {"owner", "admin"}
+        and channel_policy.get("require_approval") is not True
+        and str(platform or "").strip().lower() in CONTROL_SURFACE_APPROVAL_BYPASS_PLATFORMS
+        and str((channel or {}).get("chat_type") or "").strip().lower() in PRIVATE_CHAT_TYPES
+    ):
+        approval_required = False
+
+    reason = "Allowed; approval required." if approval_required else "Allowed."
+    if approval_mode == "off":
+        reason = "Allowed; business approval rollout is off."
+    elif (
+        not approval_required
+        and str(platform or "").strip().lower() == "feishu"
+        and _feishu_approvals_disabled()
+    ):
+        reason = "Allowed on Feishu; approvals are disabled by platform policy."
+    elif not approval_required and role in {"owner", "admin"}:
+        normalized_platform = str(platform or "").strip().lower()
+        normalized_chat_type = str((channel or {}).get("chat_type") or "").strip().lower()
+        if normalized_platform in CONTROL_SURFACE_APPROVAL_BYPASS_PLATFORMS and normalized_chat_type in PRIVATE_CHAT_TYPES:
+            reason = "Allowed on private control surface; business approval bypassed for owner/admin."
+        elif permissions.get("bypass_approval") is True:
+            reason = "Allowed; approval bypassed by owner/admin policy."
 
     return {
         "allowed": True,
         "approval_required": approval_required,
-        "reason": "Allowed; approval required." if approval_required else "Allowed.",
+        "reason": reason,
         "role": role,
         "risk_level": risk,
         "capability": cap,
@@ -2365,16 +2419,22 @@ def decide_approval(approval_id: str, *, status: str, approved_by: str = "") -> 
                     """,
                     (approval_id, _now(), row["target_id"]),
                 )
-            elif normalized == "denied":
+            elif normalized in {"denied", "cancelled"}:
+                blocker = "Approval denied." if normalized == "denied" else "Approval cancelled."
+                result = (
+                    "Capability run was denied before execution."
+                    if normalized == "denied"
+                    else "Capability run was cancelled before execution."
+                )
                 conn.execute(
                     """
                     UPDATE capability_runs
-                    SET status='cancelled', blocker='Approval denied.',
-                        result='Capability run was denied before execution.', approval_id=?,
+                    SET status='cancelled', blocker=?,
+                        result=?, approval_id=?,
                         finished_at_unix=?, updated_at_unix=?
                     WHERE run_id=?
                     """,
-                    (approval_id, _now(), _now(), row["target_id"]),
+                    (blocker, result, approval_id, _now(), _now(), row["target_id"]),
                 )
         conn.commit()
     if not target_task_id and row["kind"] == "capability_run":

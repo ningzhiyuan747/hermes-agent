@@ -77,3 +77,52 @@ class TestResolveCdpOverride:
             "https://cdp.browser-use.example/session/json/version",
             timeout=10,
         )
+
+
+class TestBrowserBackendStatus:
+    def test_reports_local_mode_when_no_override_or_cloud_provider(self, monkeypatch):
+        from tools.browser_tool import get_browser_backend_status
+
+        monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
+        monkeypatch.setattr("tools.browser_tool._get_cloud_provider", lambda: None)
+
+        status = get_browser_backend_status()
+
+        assert status["mode"] == "local"
+        assert status["connected"] is False
+        assert "local headless Chromium" in status["label"]
+
+    def test_reports_cdp_discovery_details(self, monkeypatch):
+        from tools.browser_tool import get_browser_backend_status
+
+        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+        response = Mock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {
+            "Browser": "Chrome/136.0.0.0",
+            "windowTitle": "Hermes Test Browser",
+            "webSocketDebuggerUrl": WS_URL,
+        }
+
+        with patch("tools.browser_tool.requests.get", return_value=response) as mock_get:
+            status = get_browser_backend_status()
+
+        assert status["mode"] == "cdp"
+        assert status["reachable"] is True
+        assert status["endpoint"] == HTTP_URL
+        assert status["resolved_endpoint"] == WS_URL
+        assert status["browser_version"] == "Chrome/136.0.0.0"
+        assert status["window_title"] == "Hermes Test Browser"
+        assert status["discovered_websocket"] == WS_URL
+        assert mock_get.call_count == 2
+
+    def test_reports_probe_error_for_unreachable_cdp_endpoint(self, monkeypatch):
+        from tools.browser_tool import get_browser_backend_status
+
+        monkeypatch.setenv("BROWSER_CDP_URL", HTTP_URL)
+        with patch("tools.browser_tool.requests.get", side_effect=RuntimeError("boom")):
+            status = get_browser_backend_status()
+
+        assert status["mode"] == "cdp"
+        assert status["reachable"] is False
+        assert "boom" in status["error"]

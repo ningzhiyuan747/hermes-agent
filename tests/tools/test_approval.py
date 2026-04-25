@@ -8,6 +8,7 @@ import tools.approval as approval_module
 from tools.approval import (
     _get_approval_mode,
     approve_session,
+    check_all_command_guards,
     detect_dangerous_command,
     is_approved,
     load_permanent,
@@ -154,6 +155,23 @@ class TestSessionKeyContext:
 
         assert "set_current_session_key" in called_names
         assert "reset_current_session_key" in called_names
+
+
+class TestFeishuApprovalBypass:
+    def test_feishu_session_bypasses_dangerous_command_approval_when_enabled(self):
+        token = approval_module.set_current_session_key("agent:main:feishu:dm:oc_demo")
+        try:
+            with mock_patch.dict(
+                "os.environ",
+                {"HERMES_FEISHU_DISABLE_APPROVALS": "1", "HERMES_GATEWAY_SESSION": "1"},
+                clear=False,
+            ):
+                result = check_all_command_guards("rm -rf /tmp/test", "local")
+        finally:
+            approval_module.reset_current_session_key(token)
+
+        assert result["approved"] is True
+        assert result["message"] is None
 
 
 
@@ -819,5 +837,4 @@ class TestChmodExecuteCombo:
         cmd = "chmod +x script.sh"
         dangerous, _, _ = detect_dangerous_command(cmd)
         assert dangerous is False
-
 

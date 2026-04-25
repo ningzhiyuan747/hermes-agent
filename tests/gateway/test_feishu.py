@@ -600,6 +600,7 @@ class TestAdapterModule(unittest.TestCase):
                 self._reconnect_interval = 120
                 self._ping_interval = 120
                 self.configure_calls = []
+                self.connect_result = None
 
             def _configure(self, conf):
                 self.configure_calls.append(conf)
@@ -610,6 +611,7 @@ class TestAdapterModule(unittest.TestCase):
             def start(self):
                 conf = SimpleNamespace(ReconnectNonce=99, ReconnectInterval=88, PingInterval=77)
                 self._configure(conf)
+                self.connect_result = fake_client_module.websockets.connect("wss://example.test/ws")
                 raise RuntimeError("stop test client")
 
         fake_client = _FakeWSClient()
@@ -620,9 +622,22 @@ class TestAdapterModule(unittest.TestCase):
             _ws_ping_interval=4,
             _ws_ping_timeout=5,
         )
+        class _FakeConnectResult:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        connect_calls = []
+
+        def _fake_connect(*args, **kwargs):
+            connect_calls.append((args, kwargs))
+            return _FakeConnectResult()
+
         fake_client_module = ModuleType("lark_oapi.ws.client")
         fake_client_module.loop = None
-        fake_client_module.websockets = SimpleNamespace(connect=AsyncMock())
+        fake_client_module.websockets = SimpleNamespace(connect=_fake_connect)
         fake_ws_module = ModuleType("lark_oapi.ws")
         fake_ws_module.client = fake_client_module
         fake_root_module = ModuleType("lark_oapi")
@@ -644,6 +659,9 @@ class TestAdapterModule(unittest.TestCase):
         self.assertEqual(fake_client._reconnect_nonce, 2)
         self.assertEqual(fake_client._reconnect_interval, 3)
         self.assertEqual(fake_client._ping_interval, 4)
+        self.assertTrue(hasattr(fake_client.connect_result, "__aenter__"))
+        self.assertEqual(connect_calls[0][1]["ping_interval"], 4)
+        self.assertEqual(connect_calls[0][1]["ping_timeout"], 5)
 
 
 class TestAdapterBehavior(unittest.TestCase):

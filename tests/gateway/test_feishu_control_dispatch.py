@@ -126,3 +126,33 @@ async def test_handle_task_control_text_broadcast_uses_channel_sync(monkeypatch)
     assert incoming.text == "发同步 已处理"
     adapter._send_plain.assert_awaited_once()
     assert adapter._send_plain.await_args.args[1] == "广播完成"
+
+
+@pytest.mark.asyncio
+async def test_sync_business_identity_marks_owner_as_approval_bypass(monkeypatch):
+    adapter = object.__new__(FeishuAdapter)
+    adapter._admins = {"ou_owner"}
+
+    captured = {}
+    monkeypatch.setattr(feishu_module, "get_user", lambda **kwargs: {})
+    monkeypatch.setattr(feishu_module, "get_channel", lambda **kwargs: {})
+    monkeypatch.setattr(feishu_module, "upsert_channel", lambda **kwargs: kwargs)
+    monkeypatch.setattr(feishu_module, "upsert_user", lambda **kwargs: captured.update(kwargs))
+
+    event = SimpleNamespace(
+        source=SimpleNamespace(
+            user_id="ou_owner",
+            user_id_alt="",
+            user_name="Owner",
+            chat_id="oc_demo",
+            thread_id="",
+            chat_name="Owner DM",
+            chat_type="dm",
+        )
+    )
+
+    await FeishuAdapter._sync_business_identity(adapter, event)
+
+    assert captured["role"] == "owner"
+    assert captured["permissions"]["bypass_approval"] is True
+    assert captured["permissions"]["global_owner"] is True

@@ -5,7 +5,10 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from dotenv import load_dotenv
+try:
+    from dotenv import load_dotenv as _python_dotenv_load
+except ImportError:
+    _python_dotenv_load = None
 
 
 # Env var name suffixes that indicate credential values.  These are the
@@ -32,16 +35,51 @@ def _sanitize_loaded_credentials() -> None:
 
 
 def _load_dotenv_with_fallback(path: Path, *, override: bool) -> None:
+    if _python_dotenv_load is None:
+        _load_dotenv_without_dependency(path, override=override)
+        _sanitize_loaded_credentials()
+        return
     try:
-        load_dotenv(dotenv_path=path, override=override, encoding="utf-8")
+        _python_dotenv_load(dotenv_path=path, override=override, encoding="utf-8")
     except UnicodeDecodeError:
-        load_dotenv(dotenv_path=path, override=override, encoding="latin-1")
+        _python_dotenv_load(dotenv_path=path, override=override, encoding="latin-1")
     # Strip non-ASCII characters from credential env vars that were just
     # loaded.  API keys must be pure ASCII since they're sent as HTTP
     # header values (httpx encodes headers as ASCII).  Non-ASCII chars
     # typically come from copy-pasting keys from PDFs or rich-text editors
     # that substitute Unicode lookalike glyphs (e.g. ʋ U+028B for v).
     _sanitize_loaded_credentials()
+
+
+def _load_dotenv_without_dependency(path: Path, *, override: bool) -> None:
+    def _parse_value(raw: str) -> str:
+        value = raw.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+            return value[1:-1]
+        return value
+
+    for encoding in ("utf-8", "latin-1"):
+        try:
+            text = path.read_text(encoding=encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        text = path.read_text(encoding="utf-8", errors="replace")
+
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        if stripped.startswith("export "):
+            stripped = stripped[len("export ") :].lstrip()
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        if not key:
+            continue
+        if not override and key in os.environ:
+            continue
+        os.environ[key] = _parse_value(value)
 
 
 def _sanitize_env_file_if_needed(path: Path) -> None:

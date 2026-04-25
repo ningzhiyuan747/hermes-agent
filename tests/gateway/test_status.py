@@ -132,6 +132,22 @@ class TestGatewayRuntimeStatus:
         assert payload["platforms"]["discord"]["error_code"] is None
         assert payload["platforms"]["discord"]["error_message"] is None
 
+    def test_write_runtime_status_prunes_platforms_not_in_current_config(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="running",
+            platform="dingtalk",
+            platform_state="disconnected",
+        )
+        status.write_runtime_status(
+            gateway_state="running",
+            configured_platforms=["feishu", "weixin"],
+        )
+
+        payload = status.read_runtime_status()
+        assert "dingtalk" not in payload["platforms"]
+
 
 class TestTerminatePid:
     def test_force_uses_taskkill_on_windows(self, monkeypatch):
