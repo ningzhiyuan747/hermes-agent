@@ -7,7 +7,7 @@ Last updated: 2026-04-25
 - Repo: `/home/user/.hermes/hermes-agent`
 - This repo is the durable memory and session owner in the current three-layer setup.
 - Current external collaborators:
-  - bridge/control plane: `F:\hermes-dingtalk-bridge`
+  - control plane: `F:\hermes-control-plane`
   - executor/runtime: local OpenClaw workspace and runtime docs
 
 ## Read This First

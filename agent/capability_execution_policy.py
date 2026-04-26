@@ -8,7 +8,7 @@ from typing import Any
 
 
 _DEFAULT_POLICY_PATH = Path(
-    os.getenv("HERMES_CAPABILITY_POLICY_FILE", "/mnt/f/hermes-dingtalk-bridge/capability_execution_policy.json")
+    os.getenv("HERMES_CAPABILITY_POLICY_FILE", "/mnt/f/hermes-control-plane/capability_execution_policy.json")
 )
 _DEFAULT_POLICY = {"executor": "hermes", "route_mode": "guided"}
 

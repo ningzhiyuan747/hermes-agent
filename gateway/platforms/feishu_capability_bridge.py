@@ -141,7 +141,7 @@ def build_codex_broker_brief(question: str) -> str:
     return (
         "这是一个明确要求交给 Codex CLI 处理的任务。\n"
         f"如果 `codex_broker` 工具可用，第一优先动作就是调用它，action={action}；不要只口头分析。\n"
-        "1. 用户指定了项目路径时，把它传给 `cwd`；没指定时，默认用 F:\\hermes-dingtalk-bridge。\n"
+        "1. 用户指定了项目路径时，把它传给 `cwd`；没指定时，默认用 F:\\hermes-control-plane。\n"
         "2. 如果是继续上一条 Codex 会话，优先用 `resume`，并沿用最近一次 broker 会话或其 thread_id。\n"
         "3. 启动后继续用 `status`、`read`、`wait` 跟进，直到拿到可验证结果，再回给用户。\n"
         "4. 没有 broker 证据时，不要说 Codex 已经运行、修改或完成。\n"

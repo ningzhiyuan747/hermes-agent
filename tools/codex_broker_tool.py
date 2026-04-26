@@ -19,11 +19,11 @@ from tools.registry import registry, tool_error, tool_result
 CODEX_BIN = Path(os.path.expanduser("~/.hermes/node/bin/codex"))
 BROKER_DIR = get_hermes_home() / "codex_broker"
 INDEX_PATH = BROKER_DIR / "sessions.json"
-CANONICAL_WSL_CWD = "/mnt/f/hermes-dingtalk-bridge"
+CANONICAL_WSL_CWD = "/mnt/f/hermes-control-plane"
 ALIAS_WSL_CWD = "/mnt/f/Desktop/爱马仕"
-CANONICAL_WINDOWS_CWD = r"F:\hermes-dingtalk-bridge"
+CANONICAL_WINDOWS_CWD = r"F:\hermes-control-plane"
 ALIAS_WINDOWS_CWD = r"F:\Desktop\爱马仕"
-CODEX_WORKSPACE_LINK = Path("/home/user/.hermes/workspaces/hermes-dingtalk-bridge")
+CODEX_WORKSPACE_LINK = Path("/home/user/.hermes/workspaces/hermes-control-plane")
 THREAD_STARTED_RE = re.compile(r'"type"\s*:\s*"thread\.started".*?"thread_id"\s*:\s*"([^"]+)"')
 
 

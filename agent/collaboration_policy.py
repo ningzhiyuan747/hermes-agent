@@ -17,7 +17,7 @@ def _candidate_policy_paths() -> list[Path]:
     candidates.extend(
         [
             repo_root / "codex-prompts" / _DEFAULT_POLICY_BASENAME,
-            Path("/mnt/f/hermes-dingtalk-bridge/codex-prompts") / _DEFAULT_POLICY_BASENAME,
+            Path("/mnt/f/hermes-control-plane/codex-prompts") / _DEFAULT_POLICY_BASENAME,
         ]
     )
     return candidates

@@ -39,7 +39,7 @@ _GENERIC_SECRET_ASSIGN_RE = re.compile(
     re.IGNORECASE,
 )
 _DINGTALK_SHARED_ENV_CANDIDATES = (
-    Path("/mnt/f/hermes-dingtalk-bridge/.env"),
+    Path("/mnt/f/hermes-control-plane/.env"),
     Path("/mnt/f/Desktop/爱马仕/.env"),
 )
 

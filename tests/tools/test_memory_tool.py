@@ -89,7 +89,7 @@ class TestScanMemoryContent:
 
 class TestScanSystemMemoryContent:
     def test_shared_system_fact_passes(self):
-        assert _scan_system_memory_content("Canonical workspace path is F:\\hermes-dingtalk-bridge") is None
+        assert _scan_system_memory_content("Canonical workspace path is F:\\hermes-control-plane") is None
 
     def test_person_preference_blocked(self):
         result = _scan_system_memory_content("用户偏好先给结论")
@@ -127,9 +127,9 @@ class TestMemoryStoreAdd:
         assert result["target"] == "user"
 
     def test_add_to_system_alias(self, store):
-        result = store.add("system", "Workspace canonical path is F:\\hermes-dingtalk-bridge")
+        result = store.add("system", "Workspace canonical path is F:\\hermes-control-plane")
         assert result["success"] is True
-        assert "Workspace canonical path is F:\\hermes-dingtalk-bridge" in result["entries"]
+        assert "Workspace canonical path is F:\\hermes-control-plane" in result["entries"]
 
     def test_add_task_state_to_system_rejected(self, store):
         result = store.add("system", "下一步是补 operator queue")

@@ -309,16 +309,16 @@ _FEISHU_DINGTALK_BRIDGE_STATUS_COMMANDS = {
     "钉钉桥身份",
     "钉桥身份",
     "桥身份",
-    "dingtalk bridge status",
-    "dingtalk bridge whoami",
+    "dingtalk adapter status",
+    "dingtalk adapter whoami",
 }
 _BID_RESEARCH_PATTERNS = (r"投标", r"招标", r"中标", r"采购公告", r"采购需求", r"招采", r"标书")
 _CONTRACT_RETRIEVAL_PATTERNS = (r"中标合同", r"采购合同", r"合同附件", r"合同原件", r"合同扫描件", r"合同")
 _FEISHU_BOT_MSG_TRACK_SIZE = 512                   # LRU size for tracking sent message IDs
 _FEISHU_REPLY_FALLBACK_CODES = frozenset({230011, 231003})  # reply target withdrawn/missing → create fallback
 _FEISHU_ACK_EMOJI = "OK"
-_DEFAULT_DINGTALK_RELAY_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/dingtalk_relay.py")
-_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/control-plane.ps1")
+_DEFAULT_DINGTALK_RELAY_SCRIPT = Path("/mnt/f/hermes-control-plane/adapters/dingtalk/relay.py")
+_DEFAULT_DINGTALK_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-control-plane/control-plane.ps1")
 _DEFAULT_WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # QR onboarding constants

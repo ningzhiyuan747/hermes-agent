@@ -79,7 +79,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
-_DEFAULT_GATEWAY_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-dingtalk-bridge/control-plane.ps1")
+_DEFAULT_GATEWAY_CONTROL_PLANE_SCRIPT = Path("/mnt/f/hermes-control-plane/control-plane.ps1")
 _DEFAULT_WINDOWS_POWERSHELL = "/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
 
 # Load environment variables from ~/.hermes/.env first.

@@ -12,9 +12,9 @@ from agent.background_jobs import append_job_event, get_job, update_job
 from agent.outbound_delivery import DeliveryTarget, send_text_to_target
 
 
-_WINDOWS_DINGTALK_RELAY = Path("/mnt/f/hermes-dingtalk-bridge/dingtalk_relay.py")
-_WINDOWS_DINGTALK_PYTHON = Path("/mnt/f/hermes-dingtalk-bridge/.venv/Scripts/python.exe")
-_WINDOWS_DINGTALK_RELAY_ARG = r"F:\hermes-dingtalk-bridge\dingtalk_relay.py"
+_WINDOWS_DINGTALK_RELAY = Path("/mnt/f/hermes-control-plane/adapters/dingtalk/relay.py")
+_WINDOWS_DINGTALK_PYTHON = Path("/mnt/f/hermes-control-plane/.venv/Scripts/python.exe")
+_WINDOWS_DINGTALK_RELAY_ARG = r"F:\hermes-control-plane\adapters\dingtalk\relay.py"
 _DINGTALK_ATTACHMENT_MAX_COUNT = 2
 _DINGTALK_ATTACHMENT_PREFERRED_SUFFIXES = (".xlsx", ".xls", ".docx", ".doc", ".pdf")
 _ABSOLUTE_ATTACHMENT_RE = re.compile(

@@ -142,7 +142,7 @@ def test_system_memory_write_bypasses_scoped_routing(tmp_path, monkeypatch):
     monkeypatch.setattr(business_db, "upsert_user_memory", lambda **kwargs: called.__setitem__("user", called["user"] + 1))
     monkeypatch.setattr(business_db, "upsert_task_memory", lambda **kwargs: called.__setitem__("task", called["task"] + 1))
 
-    result = json.loads(memory_mod.memory_tool(action="add", target="system", content="Canonical workspace is F:\\hermes-dingtalk-bridge", store=store))
+    result = json.loads(memory_mod.memory_tool(action="add", target="system", content="Canonical workspace is F:\\hermes-control-plane", store=store))
 
     assert result["success"] is True
     assert called["user"] == 0
