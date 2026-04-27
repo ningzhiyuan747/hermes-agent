@@ -147,3 +147,17 @@ def test_system_memory_write_bypasses_scoped_routing(tmp_path, monkeypatch):
     assert result["success"] is True
     assert called["user"] == 0
     assert called["task"] == 0
+
+
+def test_memory_dir_can_follow_hermes_memory_profile(tmp_path, monkeypatch):
+    root = tmp_path / ".hermes"
+    active = root / "profiles" / "openclaw"
+    owner = root / "profiles" / "business"
+    active.mkdir(parents=True)
+    owner.mkdir(parents=True)
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(active))
+    monkeypatch.setenv("HERMES_MEMORY_PROFILE", "business")
+    monkeypatch.delenv("HERMES_MEMORY_HOME", raising=False)
+
+    assert memory_mod.get_memory_dir() == owner / "memories"

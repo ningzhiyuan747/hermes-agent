@@ -30,7 +30,7 @@ import re
 import tempfile
 from contextlib import contextmanager
 from pathlib import Path
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_memory_home
 from typing import Dict, Any, List, Optional
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
@@ -51,8 +51,13 @@ logger = logging.getLogger(__name__)
 # constant was cached at import time and could go stale if a profile switch
 # happened after the first import.
 def get_memory_dir() -> Path:
-    """Return the profile-scoped memories directory."""
-    return get_hermes_home() / "memories"
+    """Return the durable memory owner directory.
+
+    By default this is the active profile's memory directory. Executor
+    profiles may set HERMES_MEMORY_PROFILE or HERMES_MEMORY_HOME to use a
+    Hermes-owned memory profile without sharing their session database.
+    """
+    return get_hermes_memory_home() / "memories"
 
 ENTRY_DELIMITER = "\n§\n"
 

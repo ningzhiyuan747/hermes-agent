@@ -130,3 +130,56 @@ class TestIsContainer:
         # Even if we make os.path.exists return False, cached value wins
         monkeypatch.setattr(os.path, "exists", lambda p: False)
         assert is_container() is True
+
+
+class TestGetHermesMemoryHome:
+    def test_defaults_to_active_profile_home(self, tmp_path, monkeypatch):
+        profile = tmp_path / ".hermes" / "profiles" / "openclaw"
+        profile.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(profile))
+        monkeypatch.delenv("HERMES_MEMORY_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_MEMORY_HOME", raising=False)
+
+        assert hermes_constants.get_hermes_memory_home() == profile
+
+    def test_profile_override_uses_named_memory_owner(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes"
+        active = root / "profiles" / "openclaw"
+        owner = root / "profiles" / "business"
+        active.mkdir(parents=True)
+        owner.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setenv("HERMES_MEMORY_PROFILE", "business")
+        monkeypatch.delenv("HERMES_MEMORY_HOME", raising=False)
+
+        assert hermes_constants.get_hermes_home() == active
+        assert hermes_constants.get_hermes_memory_home() == owner
+
+
+    def test_profile_override_can_come_from_active_profile_dotenv(self, tmp_path, monkeypatch):
+        root = tmp_path / ".hermes"
+        active = root / "profiles" / "openclaw"
+        owner = root / "profiles" / "business"
+        active.mkdir(parents=True)
+        owner.mkdir(parents=True)
+        (active / ".env").write_text("HERMES_MEMORY_PROFILE=business\n")
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.delenv("HERMES_MEMORY_PROFILE", raising=False)
+        monkeypatch.delenv("HERMES_MEMORY_HOME", raising=False)
+
+        assert hermes_constants.get_hermes_memory_home() == owner
+
+    def test_explicit_memory_home_wins(self, tmp_path, monkeypatch):
+        active = tmp_path / ".hermes" / "profiles" / "openclaw"
+        explicit = tmp_path / "shared-memory-owner"
+        active.mkdir(parents=True)
+        explicit.mkdir()
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(active))
+        monkeypatch.setenv("HERMES_MEMORY_PROFILE", "business")
+        monkeypatch.setenv("HERMES_MEMORY_HOME", str(explicit))
+
+        assert hermes_constants.get_hermes_memory_home() == explicit

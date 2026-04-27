@@ -17,6 +17,45 @@ def get_hermes_home() -> Path:
     return Path(os.getenv("HERMES_HOME", Path.home() / ".hermes"))
 
 
+def get_hermes_memory_home() -> Path:
+    """Return the durable memory owner directory for this process.
+
+    Normal profile state remains under :func:`get_hermes_home`. Executor
+    profiles can opt into a Hermes-owned durable memory profile by setting
+    ``HERMES_MEMORY_PROFILE=<profile>`` or an explicit ``HERMES_MEMORY_HOME``.
+    This lets an execution profile keep its own sessions and credentials while
+    reading/writing the same durable memory owner as Hermes.
+    """
+    explicit = str(os.getenv("HERMES_MEMORY_HOME", "") or _dotenv_value("HERMES_MEMORY_HOME")).strip()
+    if explicit:
+        return Path(explicit).expanduser()
+
+    profile = str(os.getenv("HERMES_MEMORY_PROFILE", "") or _dotenv_value("HERMES_MEMORY_PROFILE")).strip()
+    if profile:
+        if profile in {"default", "."}:
+            return get_default_hermes_root()
+        return get_default_hermes_root() / "profiles" / profile
+
+    return get_hermes_home()
+
+
+def _dotenv_value(name: str) -> str:
+    """Read a simple KEY=value from the active profile .env without loading it."""
+    try:
+        env_path = get_hermes_home() / ".env"
+        for raw_line in env_path.read_text().splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            if key.strip() != name:
+                continue
+            return value.strip().strip('"').strip("'")
+    except Exception:
+        return ""
+    return ""
+
+
 def get_default_hermes_root() -> Path:
     """Return the root Hermes directory for profile-level operations.
 

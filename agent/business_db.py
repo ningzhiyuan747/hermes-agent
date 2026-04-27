@@ -12,7 +12,7 @@ from typing import Any, Dict, Iterable, Optional
 from agent.capability_execution_policy import get_capability_execution_policy
 from gateway.status import acquire_scoped_lock, release_scoped_lock
 from hermes_cli.env_loader import load_hermes_dotenv
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, get_hermes_memory_home
 
 
 load_hermes_dotenv(
@@ -69,7 +69,7 @@ def _feishu_approvals_disabled() -> bool:
 
 
 def db_path() -> Path:
-    override = Path(str(get_hermes_home() / "hermes-business.sqlite3"))
+    override = Path(str(get_hermes_memory_home() / "hermes-business.sqlite3"))
     override.parent.mkdir(parents=True, exist_ok=True)
     return override
 
