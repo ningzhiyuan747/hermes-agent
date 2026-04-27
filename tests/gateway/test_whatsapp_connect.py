@@ -64,6 +64,8 @@ def _make_adapter():
     adapter._auto_tts_disabled_chats = set()
     adapter._message_queue = asyncio.Queue()
     adapter._http_session = None
+    adapter._acquire_platform_lock = MagicMock(return_value=True)
+    adapter._release_platform_lock = MagicMock()
     return adapter
 
 

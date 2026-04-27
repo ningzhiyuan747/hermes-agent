@@ -22,6 +22,19 @@ from gateway.platforms.base import MessageEvent
 from gateway.session import SessionEntry, SessionSource, build_session_key
 
 
+@pytest.fixture(autouse=True)
+def _isolate_approval_config(monkeypatch):
+    """Keep approval tests independent from the user's real config.yaml."""
+    monkeypatch.setattr(
+        "tools.approval._get_approval_config",
+        lambda: {"mode": "manual", "timeout": 60, "gateway_timeout": 300},
+    )
+    monkeypatch.setattr(
+        "tools.tirith_security.check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+
+
 def _make_source() -> SessionSource:
     return SessionSource(
         platform=Platform.TELEGRAM,
